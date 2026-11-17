@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -207,6 +207,10 @@ pub struct Node {
     last_fee_refresh: Mutex<Option<u64>>,
     rotation: AtomicUsize,
     started_at: u64,
+    /// When (node clock) a source request or a poll round last finished,
+    /// successful or not. The systemd watchdog pings only while this is
+    /// recent, so a hung node gets restarted instead of serving a stale tip.
+    last_progress: AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -250,7 +254,22 @@ impl Node {
             last_fee_refresh: Mutex::new(None),
             rotation: AtomicUsize::new(0),
             started_at,
+            last_progress: AtomicU64::new(started_at),
         }
+    }
+
+    fn mark_progress(&self) {
+        self.last_progress
+            .store(self.clock.now(), Ordering::Relaxed);
+    }
+
+    /// Seconds since a source request or a poll round last finished. Failed
+    /// requests count: they show the node is still working. Only a hang
+    /// (nothing finishing at all) makes this grow past one poll interval.
+    pub fn seconds_since_progress(&self) -> u64 {
+        self.clock
+            .now()
+            .saturating_sub(self.last_progress.load(Ordering::Relaxed))
     }
 
     pub fn network(&self) -> Network {
@@ -295,6 +314,7 @@ impl Node {
             crate::time::sleep(wait).await;
         }
         let res = f(h.source.clone()).await;
+        self.mark_progress();
         let now = self.clock.now();
         let mut st = lock(&h.state);
         match &res {
@@ -550,6 +570,7 @@ impl Node {
             if let Err(e) = self.start().await {
                 warn!(error = %e, "not started yet");
             }
+            self.mark_progress();
             return;
         }
         let unchecked: Vec<usize> = (0..self.sources.len())
@@ -564,6 +585,7 @@ impl Node {
         self.refresh_fees_if_due(now).await;
         self.recheck_broadcasts().await;
         self.update_alarms(self.clock.now());
+        self.mark_progress();
     }
 
     async fn poll_tip(&self, i: usize) {

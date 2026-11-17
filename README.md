@@ -77,6 +77,26 @@ Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_di
 
 **One heads-up before you try:** Blockstream's keyless API now allows 700 requests an hour per IP. Through their onion, every Tor user shares that limit, so that source is rate-limited almost all the time. For now, add a self-hosted Esplora on your own network as a second source. Otherwise Trust Issues will follow the chain but, correctly, never say "synced".
 
+## Run it as a service
+
+**Is it up?** `GET /health` needs no login and says only whether it's up and synced. From a script or Docker's `HEALTHCHECK`:
+
+```bash
+trust-issues health-check --config examples/signet.toml
+```
+
+It exits 0 if the server answers. Add `--synced` to also require "synced".
+
+**systemd:** Trust Issues speaks systemd's notify protocol (no extra dependency). It reports ready once the RPC server is listening, shows its state in `systemctl status`, and pings the watchdog only while it's making progress. If it ever hangs, systemd restarts it instead of letting it quietly serve an old tip. Explorers being down isn't a hang: it keeps running and raises its alarms.
+
+```ini
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/trust-issues --config /etc/trust-issues/signet.toml
+WatchdogSec=120
+Restart=on-failure
+```
+
 ## What's unsafe for real money
 Signet and regtest are what it's for right now. With real money, these are unsafe:
 - **Only one explorer.** One source can hide a cheating close until your penalty window passes.
@@ -93,7 +113,7 @@ Mainnet stays off until someone outside the project has reviewed it. Even then, 
 cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo deny --locked check
 ```
 
-All 53 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
+All 58 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
 
 ## Found a problem?
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.

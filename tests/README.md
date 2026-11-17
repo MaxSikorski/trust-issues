@@ -13,6 +13,15 @@ Two examples are not tests:
 | the_demo_ends_not_synced_with_a_critical_tip_alarm | The last scene drops "synced" and raises the critical tip alarm |
 | the_demo_events_serialize_for_the_browser | The events become the JSON the web page reads |
 
+## service.rs: running as a service (5)
+| Test | Checks |
+|---|---|
+| health_needs_no_login_and_says_only_up_and_synced | `/health` answers without a login with only up/ready/synced; `/status` still needs it; a source down 5+ minutes drops "synced" |
+| progress_resets_on_every_poll_even_when_every_source_fails | The watchdog's progress clock resets every poll, even with every explorer down (down isn't hung) |
+| the_watchdog_pings_only_while_the_node_makes_progress | No ping once progress is older than one poll interval plus 180 s |
+| watchdog_settings_are_read_like_systemd_means_them | `WATCHDOG_USEC` halved; `WATCHDOG_PID` must be ours; bad values mean no watchdog |
+| notify_sends_one_datagram_to_the_socket | One datagram to the socket; abstract `@` sockets refused |
+
 ## chain_rules.rs: the header chain (9)
 | Test | Checks |
 |---|---|

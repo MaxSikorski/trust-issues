@@ -89,6 +89,7 @@ pub fn router(node: Arc<Node>, auth: Auth) -> Router {
     Router::new()
         .route("/", post(handle_rpc))
         .route("/status", get(handle_status))
+        .route("/health", get(handle_health))
         .with_state(AppState {
             node,
             auth: Arc::new(auth),
@@ -102,6 +103,18 @@ fn unauthorized() -> Response {
         "",
     )
         .into_response()
+}
+
+/// `GET /health`, with no login: for Docker's HEALTHCHECK, systemd and
+/// platform dashboards. It says only that we're up and whether we'd tell
+/// Lightning "synced"; everything else stays behind the login on `/status`.
+async fn handle_health(State(s): State<AppState>) -> Response {
+    axum::Json(json!({
+        "status": "ok",
+        "ready": s.node.is_ready(),
+        "synced": s.node.is_synced(),
+    }))
+    .into_response()
 }
 
 async fn handle_status(State(s): State<AppState>, headers: HeaderMap) -> Response {

@@ -19,6 +19,8 @@ pub mod config;
 pub mod esplora;
 #[cfg(feature = "server")]
 pub mod rpc;
+#[cfg(feature = "server")]
+pub mod systemd;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm;

@@ -1,8 +1,7 @@
 Trust Issues (trust-issues)
 Copyright 2026 Max Sikorski
 
-Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or
-the MIT license (LICENSE-MIT), at your option.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 This product depends on third-party crates, each under its own permissive
 licence (checked with `cargo deny`; see deny.toml), including rust-bitcoin

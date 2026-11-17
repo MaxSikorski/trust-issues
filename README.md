@@ -91,4 +91,4 @@ All 50 tests are deterministic: fake explorers, a hand-set clock, no network. Ev
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.
 
 ## Licence
-MIT OR Apache-2.0, whichever you prefer ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). Dependencies are permissive only, checked by `cargo deny`.
+Apache-2.0 ([LICENSE](LICENSE)). It's free to use, change and share, and it includes a patent grant. Dependencies are permissive only, checked by `cargo deny`.

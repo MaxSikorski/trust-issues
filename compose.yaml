@@ -80,7 +80,7 @@ services:
       - --bitcoin.node=bitcoind
       - --bitcoind.rpchost=trust-issues:38332
       - --bitcoind.rpccookie=/cookie/.cookie
-      - --bitcoind.rpcpolling=true
+      - --bitcoind.rpcpolling
       # No --noseedbackup: create the wallet yourself with lncli create.
     volumes:
       - lnd-data:/root/.lnd

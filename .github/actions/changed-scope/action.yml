@@ -1,0 +1,53 @@
+# Decides whether a run needs the Rust jobs. Output `rust` is "false" only on
+# a pull request whose every changed file is documentation: anything under
+# docs/ except docs/build.sh and docs/*.wasm, or a Markdown file at the
+# repository root. Here docs/ holds the browser demo: the page, its picture,
+# and the WebAssembly engine built from src/ (and the script that builds it),
+# so build.sh and the .wasm relate to Rust and run the full checks. Markdown
+# deeper in the tree (src/, tests/, examples/) can be compiled in with
+# include_str!, so it runs the full checks too. Everything else, and any
+# error, is "true": when in doubt, run the full checks.
+#
+# The checkout of a pull request is GitHub's merge commit, and its first
+# parent is the base branch, so `git diff HEAD^1 HEAD` is exactly what the PR
+# changes. The calling job needs `fetch-depth: 2` so both commits exist.
+#
+# File names are untrusted. They never go through ${{ }}; the script reads
+# them NUL-separated, the only form that is safe for any name.
+name: changed-scope
+description: Says whether a change touches anything beyond documentation.
+
+outputs:
+  rust:
+    description: '"true" if the Rust jobs must run, "false" for a docs-only pull request.'
+    value: ${{ steps.scope.outputs.rust }}
+
+runs:
+  using: composite
+  steps:
+    - id: scope
+      shell: bash
+      run: |
+        set -u
+        rust=true
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+          list="$(mktemp)"
+          if git diff -z --name-only HEAD^1 HEAD > "${list}" 2>/dev/null && [ -s "${list}" ]; then
+            docs_only=true
+            while IFS= read -r -d '' path; do
+              case "${path}" in
+                docs/build.sh|docs/*.wasm) docs_only=false ;;
+                docs/*) ;;
+                */*) docs_only=false ;;
+                *.md) ;;
+                *) docs_only=false ;;
+              esac
+            done < "${list}"
+            if [ "${docs_only}" = true ]; then
+              rust=false
+            fi
+          fi
+          rm -f "${list}"
+        fi
+        echo "rust=${rust}" >> "${GITHUB_OUTPUT}"
+        echo "Rust jobs needed: ${rust}"

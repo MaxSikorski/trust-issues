@@ -1,0 +1,89 @@
+# CodeQL static analysis for the Rust code. Results show up under
+# Security > Code scanning.
+#
+# Build scripts and proc macros DO run during extraction: with build mode
+# "none" the Rust extractor still runs `cargo check`, and that executes the
+# code of the project and of every dependency's build.rs and proc macros. So
+# the analysis job gets a read-only token and uploads nothing. The write token
+# (security-events: write) sits in a separate job that never checks out or
+# builds anything: it only receives the finished results file and uploads it.
+#
+# CodeQL installs its own fixed Rust toolchain (1.99.0) during analysis, so
+# the pinned toolchain from rust-toolchain.toml is not installed here.
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Monday 05:41 UTC.
+    - cron: "41 5 * * 1"
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the older run of the same PR. Every
+# commit on main has its own group (the commit id), so pushes to main never
+# replace each other's runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      # Docs-only pull requests skip the analysis below.
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.scope.outputs.rust == 'true'
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: steps.scope.outputs.rust == 'true'
+        with:
+          category: "/language:rust"
+          upload: never
+          output: sarif-results
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.scope.outputs.rust == 'true'
+        with:
+          name: sarif-results
+          path: sarif-results
+          if-no-files-found: error
+          retention-days: 1
+
+  # Uploads the results. Simplest correct guard: this job runs only when
+  # analyze said it produced results (the `rust` output), so a docs-only pull
+  # request never looks for an artifact that does not exist. If analyze fails,
+  # this job is skipped too, because `needs` requires it to succeed.
+  upload:
+    name: upload
+    needs: analyze
+    if: needs.analyze.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sarif-results
+          path: sarif-results
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: sarif-results

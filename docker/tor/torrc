@@ -1,0 +1,12 @@
+# Tor client only. Reachable from the compose backend network and nowhere else.
+ClientOnly 1
+SocksPort 0.0.0.0:9050
+# Only the compose `backend` network (fixed subnet in compose.yaml) and the
+# container's own loopback (for the health check).
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 172.31.250.0/24
+SocksPolicy reject *
+DataDirectory /var/lib/tor
+# No ControlPort, no relay, no exit.
+Log notice stdout
+Log notice file /var/lib/tor/notice.log

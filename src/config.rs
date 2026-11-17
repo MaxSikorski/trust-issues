@@ -11,11 +11,16 @@ use serde::Deserialize;
 use crate::limits::{DEFAULT_REQUESTS_PER_SEC, HARD_MAX_REQUESTS_PER_SEC};
 
 /// Official onion addresses, taken from each site's own `Onion-Location`
-/// header (checked 2026-11-16).
+/// header (mempool.space and blockstream.info checked 2026-11-16,
+/// mempool.emzy.de 2026-11-17).
 pub const MEMPOOL_ONION: &str =
     "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion";
 pub const BLOCKSTREAM_ONION: &str =
     "http://explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion";
+/// Emzy's community mempool instance: separate operator and servers from
+/// mempool.space, so it counts as an independent source.
+pub const EMZY_ONION: &str =
+    "http://mempool4t6mypeemozyterviq3i5de4kpoua65r3qkn5i3kknu5l2cad.onion";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -167,8 +172,11 @@ pub fn default_sources(network: Network) -> Vec<(String, String)> {
         Network::Signet => "/signet/api",
         _ => return Vec::new(),
     };
+    // Blockstream's keyless onion is rate-limited almost all the time
+    // (shared by every Tor user), so Emzy's makes sure two can answer.
     vec![
         ("mempool.space".into(), format!("{MEMPOOL_ONION}{path}")),
+        ("mempool.emzy.de".into(), format!("{EMZY_ONION}{path}")),
         (
             "blockstream.info".into(),
             format!("{BLOCKSTREAM_ONION}{path}"),

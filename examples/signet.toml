@@ -19,8 +19,9 @@ poll_interval_secs = 60
 # six blocks below the tip that two sources agree on.
 # checkpoint = "331223:000000083a22d511e2687f326ca3209d9955ea04bf9338d8727a1f4f937854e2"
 
-# Leave `sources` out to use mempool.space and blockstream.info over their
-# onions. Or list your own; you need at least two. A self-hosted Esplora on
+# Leave `sources` out to use mempool.space, mempool.emzy.de and blockstream.info
+# over their onions (Blockstream's is usually rate-limited, so the other two do
+# the work). Or list your own; you need at least two. A self-hosted Esplora on
 # your own network is reached directly (no Tor needed, it never leaves home).
 #
 # [[sources]]

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use bitcoin::hex::DisplayHex;
 use common::*;
 use serde_json::{Value, json};
-use trust_issues::node::{BROADCAST_ALARM_SECS, BROADCAST_FIRST_CHECK_SECS, ManualClock, Node};
+use trust_issues::node::{
+    BROADCAST_ALARM_SECS, BROADCAST_FIRST_CHECK_SECS, ManualClock, Node, header_hex,
+};
 use trust_issues::rpc::{Auth, process_body, router};
 use trust_issues::source::{Source, SourceError};
 
@@ -328,4 +330,233 @@ async fn the_http_server_requires_the_cookie_or_rpc_password() {
     assert_eq!(v["synced"], true);
     assert_eq!(v["healthy_sources"], 2);
     let _ = SourceError::NotFound;
+}
+
+#[tokio::test]
+async fn deployment_info_says_taproot_like_bitcoin_core() {
+    // LND v0.21 refuses a backend unless getdeploymentinfo lists taproot
+    // (before Core v31) or a TAPROOT script flag (Core v31 and later).
+    let blocks = build_chain(2, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let (node, _) = started_node(&[a, b], &blocks).await;
+    let (status, v) = rpc(&node, "getdeploymentinfo", json!([])).await;
+    assert_eq!(status, 200);
+    let r = &v["result"];
+    assert_eq!(r["deployments"]["taproot"]["active"], true);
+    assert_eq!(r["deployments"]["taproot"]["type"], "buried");
+    assert_eq!(r["deployments"]["segwit"]["active"], true);
+    assert!(
+        r["script_flags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("TAPROOT"))
+    );
+    assert_eq!(r["height"], 2);
+}
+
+/// A node whose checkpoint is block 10 of `blocks`, ticked once.
+async fn node_from_block_10(sources: &[Arc<FakeSource>], blocks: &[bitcoin::Block]) -> Arc<Node> {
+    let clock = Arc::new(ManualClock::new(
+        u64::from(blocks.last().unwrap().header.time) + 60,
+    ));
+    let dyns: Vec<Arc<dyn Source>> = sources
+        .iter()
+        .map(|s| s.clone() as Arc<dyn Source>)
+        .collect();
+    let node = Arc::new(Node::new(
+        settings(Some((10, blocks[10].block_hash()))),
+        dyns,
+        clock,
+    ));
+    node.start().await.expect("start");
+    node.tick().await;
+    node
+}
+
+#[tokio::test]
+async fn old_blocks_below_the_checkpoint_are_answered_when_sources_agree() {
+    // LND's wallet searches from block 0 for its birthday, so it asks for
+    // heights far below our checkpoint.
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a, b], &blocks).await;
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert_eq!(v["result"], blocks[5].block_hash().to_string());
+    let (_, v) = rpc(
+        &node,
+        "getblockheader",
+        json!([blocks[5].block_hash().to_string(), false]),
+    )
+    .await;
+    assert_eq!(v["result"], header_hex(&blocks[5].header));
+    let (_, v) = rpc(
+        &node,
+        "getblockheader",
+        json!([blocks[5].block_hash().to_string()]),
+    )
+    .await;
+    assert_eq!(v["result"]["height"], 5);
+    assert_eq!(
+        v["result"]["confirmations"], 0,
+        "cross-checked, not proven: no confirmations claimed"
+    );
+    // The genesis header is served too.
+    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+    let (_, v) = rpc(
+        &node,
+        "getblockheader",
+        json!([genesis.block_hash().to_string(), false]),
+    )
+    .await;
+    assert_eq!(v["result"], header_hex(&genesis.header));
+    // The whole block is served too, proven against that header.
+    let hash5 = blocks[5].block_hash().to_string();
+    let (_, v) = rpc(&node, "getblock", json!([hash5, 0])).await;
+    assert_eq!(
+        v["result"],
+        bitcoin::consensus::encode::serialize(&blocks[5]).to_lower_hex_string()
+    );
+    let (_, v) = rpc(&node, "getblock", json!([hash5, 1])).await;
+    assert_eq!(v["result"]["height"], 5);
+    assert_eq!(v["result"]["nTx"], 1);
+    // Above the tip is still out of range.
+    let (_, v) = rpc(&node, "getblockhash", json!([21])).await;
+    assert_eq!(v["error"]["code"], -8);
+}
+
+#[tokio::test]
+async fn old_blocks_fail_closed_when_sources_disagree_or_only_one_answers() {
+    let blocks = build_chain(20, 1);
+    let other = fork(&blocks, 3, 17, 2);
+    let a = FakeSource::honest("a", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let node = node_from_block_10(&[a.clone(), c.clone()], &blocks).await;
+    // c now claims a different history below the checkpoint.
+    c.with(|s| s.blocks = other.clone());
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("disagree"));
+    assert!(
+        alarm_codes(&node).contains(&"old-block-disagreement".to_string()),
+        "the operator is told, not just the log"
+    );
+    // Back in agreement: answered, and the alarm clears.
+    c.with(|s| s.blocks = blocks.clone());
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert_eq!(v["result"], blocks[5].block_hash().to_string());
+    assert!(!alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
+    // With only one source answering, it won't guess.
+    c.with(|s| s.fail = Some(SourceError::Transport("down".into())));
+    let (_, v) = rpc(&node, "getblockhash", json!([6])).await;
+    assert!(v["result"].is_null(), "{v}");
+}
+
+#[tokio::test]
+async fn old_block_lookups_ask_two_sources_once_even_when_asked_twice_at_once() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone(), c.clone()], &blocks).await;
+    let before: usize = [&a, &b, &c].iter().map(|s| s.with(|st| st.calls)).sum();
+    let (r1, r2) = tokio::join!(
+        rpc(&node, "getblockhash", json!([5])),
+        rpc(&node, "getblockhash", json!([5]))
+    );
+    assert_eq!(r1.1["result"], blocks[5].block_hash().to_string());
+    assert_eq!(r2.1["result"], r1.1["result"]);
+    let after: usize = [&a, &b, &c].iter().map(|s| s.with(|st| st.calls)).sum();
+    // Two hash answers plus one header: the second request waits and reuses it.
+    assert_eq!(after - before, 3);
+}
+
+#[tokio::test]
+async fn a_bad_old_header_marks_its_source_and_the_honest_copy_is_used() {
+    let blocks = build_chain(20, 1);
+    let liar = FakeSource::honest("liar", &blocks);
+    let honest = FakeSource::honest("honest", &blocks);
+    let node = node_from_block_10(&[liar.clone(), honest], &blocks).await;
+    // The liar agrees on the hash but serves some other header for it.
+    liar.with(|s| s.header_lie = Some(blocks[4].header));
+    // Sources are asked in rotating order; within a few lookups the liar is
+    // the one asked for a header. Every answer is still the true block.
+    for h in 5..9u32 {
+        let (_, v) = rpc(&node, "getblockhash", json!([h])).await;
+        assert_eq!(v["result"], blocks[h as usize].block_hash().to_string());
+        if alarm_codes(&node).iter().any(|c| c == "source-bad:liar") {
+            return;
+        }
+    }
+    panic!("the liar was never caught serving a bad header");
+}
+
+#[tokio::test]
+async fn a_lone_dissenter_is_outvoted_for_old_blocks_but_reported() {
+    let blocks = build_chain(20, 1);
+    let other = fork(&blocks, 3, 17, 2);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let node = node_from_block_10(&[a, b, c.clone()], &blocks).await;
+    c.with(|s| s.blocks = other.clone());
+    // Whichever pair is asked first, two honest votes beat one.
+    for h in 4..8u32 {
+        let (_, v) = rpc(&node, "getblockhash", json!([h])).await;
+        assert_eq!(v["result"], blocks[h as usize].block_hash().to_string());
+    }
+    assert!(alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
+}
+
+#[tokio::test]
+async fn a_chain_block_offered_as_an_old_one_is_refused() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    // Both claim our checkpoint block sits at height 5.
+    let mut lie = blocks.clone();
+    lie[5] = blocks[10].clone();
+    for s in [&a, &b] {
+        s.with(|st| st.blocks = lie.clone());
+    }
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "{v}");
+    // And the real block keeps its real height.
+    let (_, v) = rpc(
+        &node,
+        "getblockheader",
+        json!([blocks[10].block_hash().to_string()]),
+    )
+    .await;
+    assert_eq!(v["result"]["height"], 10);
+}
+
+#[tokio::test]
+async fn an_old_answer_that_contradicts_the_checkpoint_is_refused() {
+    // Block 9 is provable: our checkpoint (block 10) names its parent.
+    let blocks = build_chain(20, 1);
+    let other = fork(&blocks, 8, 12, 2);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    let (_, v) = rpc(&node, "getblockhash", json!([9])).await;
+    assert_eq!(v["result"], blocks[9].block_hash().to_string());
+    // Both now agree on a different block 9: still refused.
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    for s in [&a, &b] {
+        let mut lie = blocks.clone();
+        lie[9] = other[9].clone();
+        s.with(|st| st.blocks = lie);
+    }
+    let (_, v) = rpc(&node, "getblockhash", json!([9])).await;
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("checkpoint"),
+        "{v}"
+    );
+    assert!(alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
 }

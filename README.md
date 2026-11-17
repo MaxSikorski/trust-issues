@@ -79,7 +79,23 @@ Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_di
 
 **Old blocks:** LND's wallet looks up blocks from long before Trust Issues's starting point (it searches from block 0 for its "birthday"). For those, two explorers must agree on the block, its header must check out, and a disagreement is refused and reported. That's cross-checked, not proven like the chain from the starting point on, so they're reported with 0 confirmations. The tip, which keeps your channels safe, always comes from the proven chain.
 
-## Run it as a service
+## Run it with Docker
+This starts Tor, Trust Issues and one Lightning node together. It's signet only.
+
+```bash
+docker compose --profile cln up    # Core Lightning
+docker compose --profile lnd up    # LND
+```
+
+The Lightning node starts only after Trust Issues says it's synced, so the first start takes a few minutes.
+
+- **LND wallet:** make it yourself. I don't turn on `--noseedbackup`.
+  `docker compose exec lnd lncli --network=signet create`
+- **CLN address:** `docker compose exec cln lightning-cli --network=signet newaddr`
+- **Where data lives:** four Docker volumes: `tor-data`, `trust-issues-data`, `cln-data`, `lnd-data`. To keep wallets in folders you choose, copy `examples/compose.override.example.yaml` to `compose.override.yaml` and set `TI_WALLETS`. Never put them inside the repo or in a temp folder.
+- **Nothing is published to the host.** Tor, the RPC and the Lightning node's own ports stay on Docker's internal network. Use `docker compose exec` to talk to the node.
+- **Login:** the Lightning node reads Trust Issues's `.cookie` file from a read-only mount. There's no password to set.
+
 
 **Is it up?** `GET /health` needs no login and says only whether it's up and synced. From a script or Docker's `HEALTHCHECK`:
 

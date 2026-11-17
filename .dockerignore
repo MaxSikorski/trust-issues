@@ -1,0 +1,14 @@
+target/
+.git/
+.github/
+.data/
+docs/
+web/
+.claude/
+.env
+.env.*
+*.cookie
+*.md
+!README.md
+CLAUDE.local.md
+.DS_Store

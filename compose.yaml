@@ -1,0 +1,82 @@
+# Tor + Trust Issues + one Lightning node, on signet only.
+#   docker compose --profile cln up     (Core Lightning)
+#   docker compose --profile lnd up     (LND)
+# One internal network. Nothing is published to the host.
+#
+# The RPC cookie (/data/.cookie) is mode 0600, owned by uid 10001 in the
+# trust-issues container. The cln and lnd images run as root, and root reads
+# any file through a read-only mount, so no permission change is needed. Do not
+# add `user:` or `cap_drop: [DAC_OVERRIDE]` to cln or lnd, or they lose access.
+
+name: trust-issues
+
+services:
+  tor:
+    build: docker/tor
+    restart: unless-stopped
+    volumes:
+      - tor-data:/var/lib/tor
+    networks: [internal]
+
+  trust-issues:
+    build: .
+    restart: unless-stopped
+    environment:
+      TRUST_ISSUES_NETWORK: signet
+      TRUST_ISSUES_TOR_SOCKS: tor:9050
+      # Sources default to three explorer onions. To change them:
+      # TRUST_ISSUES_SOURCES: "name=http://example.onion,name2=http://other.onion"
+    volumes:
+      - trust-issues-data:/data
+    depends_on:
+      tor:
+        condition: service_healthy
+    networks: [internal]
+
+  cln:
+    profiles: [cln]
+    image: elementsproject/lightningd:v26.06.10@sha256:59f10c4c7429bb80791481c906859f6de1aa58ef224758aa25d50b7d47fc0c04
+    restart: unless-stopped
+    command:
+      - --network=signet
+      - --bitcoin-rpcconnect=trust-issues
+      - --bitcoin-rpcport=38332
+      - --bitcoin-datadir=/bitcoin
+      - --disable-dns
+      - --log-level=info
+    volumes:
+      - cln-data:/root/.lightning
+      # CLN looks for the cookie at <datadir>/signet/.cookie.
+      - trust-issues-data:/bitcoin/signet:ro
+    depends_on:
+      trust-issues:
+        condition: service_healthy
+    networks: [internal]
+
+  lnd:
+    profiles: [lnd]
+    image: lightninglabs/lnd:v0.21.8-beta@sha256:f17b2944b1b76396cccbe58feac469b6cefb5f407557ac77f0880f136fb935f9
+    restart: unless-stopped
+    command:
+      - --bitcoin.signet
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=trust-issues:38332
+      - --bitcoind.rpccookie=/cookie/.cookie
+      - --bitcoind.rpcpolling=true
+      # No --noseedbackup: create the wallet yourself with lncli create.
+    volumes:
+      - lnd-data:/root/.lnd
+      - trust-issues-data:/cookie:ro
+    depends_on:
+      trust-issues:
+        condition: service_healthy
+    networks: [internal]
+
+networks:
+  internal: {}
+
+volumes:
+  tor-data:
+  trust-issues-data:
+  cln-data:
+  lnd-data:

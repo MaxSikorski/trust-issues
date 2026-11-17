@@ -32,6 +32,7 @@
             --btn-sec-hover: rgba(255, 255, 255, 0.1);
             --divider: rgba(255, 255, 255, 0.08);
             --text-muted: rgba(255, 255, 255, 0.5);
+            --glass-bg: rgba(0, 0, 0, 0.72);
         }
 
         [data-theme="light"] {
@@ -49,6 +50,7 @@
             --btn-sec-hover: rgba(0, 0, 0, 0.05);
             --divider: rgba(0, 0, 0, 0.08);
             --text-muted: rgba(0, 0, 0, 0.5);
+            --glass-bg: rgba(245, 245, 247, 0.78);
         }
 
         /* ---------- Typography and base (§3, §4.1) ---------- */
@@ -93,6 +95,12 @@
             justify-content: space-between;
             align-items: center;
             z-index: 100;
+            /* Frosted glass, as on Guard Dog's site: text scrolling under the bar stays readable. */
+            transition: padding 0.3s ease;
+            background: var(--glass-bg);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border-bottom: 1px solid var(--divider);
         }
 
         .logo {

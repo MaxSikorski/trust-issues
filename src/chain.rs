@@ -260,19 +260,26 @@ impl HeaderChain {
         self.height_of(hash).and_then(|h| self.hash_at(h + 1))
     }
 
-    /// Median time of the last 11 headers ending at `hash` (as far back as we know).
+    /// Median time of the last 11 headers ending at `hash` (as far back as
+    /// we know, the headers the walk back proved below the checkpoint
+    /// included).
     pub fn median_time_past(&self, hash: &BlockHash) -> u32 {
+        let Some(mut cur) = self.entries.get(hash).cloned() else {
+            return 0;
+        };
         let mut times = Vec::with_capacity(11);
-        let mut cur = *hash;
-        while times.len() < 11 {
-            let Some(e) = self.entries.get(&cur) else {
+        loop {
+            times.push(cur.header.time);
+            if times.len() == 11 {
                 break;
-            };
-            times.push(e.header.time);
-            cur = e.header.prev_blockhash;
+            }
+            match self.parent_of(&cur, &[]) {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
         times.sort_unstable();
-        times.get(times.len() / 2).copied().unwrap_or(0)
+        times[times.len() / 2]
     }
 
     /// The next header the walk back from the checkpoint needs, as its
@@ -339,6 +346,25 @@ impl HeaderChain {
             0 => self.entries[&self.base_hash].header.prev_blockhash,
             _ => self.walked[i - 1].prev_blockhash,
         })
+    }
+
+    /// The hash at `height`, below the checkpoint, when it's proven: by the
+    /// walk back, as the parent the lowest header we hold names (the
+    /// checkpoint itself, or the last header walked), or genesis at 0.
+    /// Nobody gets a vote on these (see `Node::deep_hash_at`).
+    pub fn proven_hash_below(&self, height: u32) -> Option<BlockHash> {
+        if height >= self.base_height {
+            return None;
+        }
+        if let Some(h) = self.hash_at(height) {
+            return Some(h);
+        }
+        let lowest = self
+            .walked
+            .last()
+            .unwrap_or(&self.entries[&self.base_hash].header);
+        let lowest_height = self.base_height - self.walked.len() as u32;
+        (height + 1 == lowest_height).then_some(lowest.prev_blockhash)
     }
 
     /// How many headers below the checkpoint the walk has proven.
@@ -465,7 +491,7 @@ impl HeaderChain {
         }
         let i = (self.base_height - 1 - height) as usize;
         Some(Entry {
-            header: self.walked[i],
+            header: *self.walked.get(i)?,
             height,
             work: Work::from_be_bytes([0; 32]),
         })

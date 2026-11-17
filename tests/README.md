@@ -22,7 +22,7 @@ Two examples are not tests:
 | watchdog_settings_are_read_like_systemd_means_them | `WATCHDOG_USEC` halved; `WATCHDOG_PID` must be ours; bad values mean no watchdog |
 | notify_sends_one_datagram_to_the_socket | One datagram to the socket; abstract `@` sockets refused |
 
-## chain_rules.rs: the header chain (20)
+## chain_rules.rs: the header chain (26)
 | Test | Checks |
 |---|---|
 | valid_chain_extends_from_checkpoint | A valid run of headers extends the chain; heights, confirmations, next block |
@@ -45,8 +45,14 @@ Two examples are not tests:
 | a_checkpoint_just_below_the_first_retarget_needs_no_vote_on_genesis | Regtest with a 16-block retarget: checkpoint at 15, one of two explorers down: the walk proves 14 to 1 from the other and takes genesis from what we know, and 16 to 20 are followed (d2097ae asked two explorers to vote on genesis and stopped at 15) |
 | catching_up_more_than_2016_blocks_after_explorers_come_back | Paused time, same rules: both explorers down for a round, then back 2085 blocks ahead: the walk finishes and the chain is followed in steps of 2016 to 2100, nobody blamed (d2097ae never got past 15) |
 | the_walk_back_is_bounded_by_what_the_rules_need | Real headers: from the last block of a period 2015 are walked (the most ever kept), from inside one back to its first, from a period's first only the 10 the median-time rule needs; regtest walks nothing |
+| catching_up_more_than_one_walk_works_across_a_fork_below_our_tip | Our tip on a branch forked 0, 1 or 10 blocks below it, explorers back 2017 blocks ahead on the other: the catch-up step starts 144 short of a full walk, so it connects and the tip reaches theirs, nobody blamed (c8b7481 stalled for good at a fork one block deep) |
+| a_slow_explorer_doesnt_hold_up_the_round_and_the_walk_prefers_the_fast_one | Paused time: one explorer takes 89 s per header: every round ends within the 20 s walk limit plus a second, the walk finishes from the fast one, and the slow one is asked at most twice (c8b7481 held a round for minutes) |
+| an_explorer_without_the_old_headers_is_asked_for_them_less_and_less | Paused time: two explorers answer "not found" for every walk header: over 30 rounds a minute apart each is asked at most 10 times, nobody blamed (c8b7481: 30 each) |
+| an_old_block_vote_is_checked_against_headers_walked_while_it_waited | Paused time: two explorers slowly name another block at 15 while a round walks back past it: the proven block is answered and both are marked bad (c8b7481 took the vote) |
+| the_median_time_rule_uses_the_headers_walked_below_the_checkpoint | A header at the median time of the 11 ending at the checkpoint passes while only the checkpoint is known and is refused once the 10 below are walked; the reported median time counts them too (c8b7481 didn't) |
+| the_median_time_at_a_real_checkpoint_counts_the_walked_headers | Real 330623 with its period walked: median time 1794546305, as getblockheader and getblockchaininfo report it (c8b7481 gave 330623's own time) |
 
-## signet_signatures.rs: signet block signatures, BIP325 (28)
+## signet_signatures.rs: signet block signatures, BIP325 (32)
 Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 330624, 331301, 331313, 331314, 331280 to 331282, and the headers 328608, 330623, 331279, 331300, 331312 and 331313; every header 328608 to 330623, read from an explorer and checked by hash and link), plus a header ground on top of the `OP_NOP` block, and two altered copies of block 331314 with their proof of work ground again: one with a signature bit flipped, one with `OP_NOP` in front of its solution.
 
 | Test | Checks |
@@ -65,7 +71,7 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | the_nop_fixture_is_the_real_block_with_one_opcode_added | The `OP_NOP` fixture differs from 331314 only by that opcode, commits to it honestly and meets the real target |
 | bootstrap_refuses_a_checkpoint_from_another_signet | Two explorers agreeing on a starting block that isn't signed for our signet: no start; with the real block it starts |
 | bootstrap_checks_the_height_proof_of_work_and_genesis | The automatic start refuses block 331314 offered at height 1 (BIP34), a signed copy missing its target, and genesis at height 1; old-block lookups refuse genesis above height 0 (all taken on 5f78d99) |
-| a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_without_blame | Real 330623 to 330624: while the explorers can't serve the headers below the checkpoint the retarget waits, with a warning and no blame; once they do, the walk back proves them down to 328608 and the retarget is checked exactly and followed (5f78d99 followed it at once) |
+| a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_without_blame | Real 330623 to 330624: while the explorers can't serve the headers below the checkpoint the retarget waits, with a warning and no blame; once they do, the walk back proves them down to 328608 and the retarget is checked exactly and followed (5f78d99 followed it at once); paused time, as a "not found" earns a 5 s wait before an explorer is asked again |
 | the_first_transaction_must_be_the_only_coinbase | A regtest block whose first transaction spends an ordinary output but carries a matching witness commitment, or one with two coinbases, is refused (5f78d99 took the first) |
 | the_unsupported_solution_warning_stays_until_that_block_is_superseded | Catching up past 331313 to the `OP_NOP` 331314: the warning stays (5f78d99 cleared it), also when refused again from the cache, and goes when the real 331314 wins |
 | a_stalled_download_doesnt_hold_up_a_ready_source | Paused time: one explorer stalls on the download, the other has the block followed within the 10 s wait plus a second, one download each (5f78d99 waited on the stalled one) |
@@ -79,6 +85,10 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | the_unsupported_solution_warning_counts_the_whole_competing_branch | The `OP_NOP` 331314 with a block on top: after the real 331314 wins, the warning stays, since the refused branch has more work (d2097ae cleared it) |
 | many_waiting_callers_start_at_most_one_extra_download | Paused time: 20 `getblock` calls for one block from a 15 s explorer make at most 2 downloads (d2097ae made 20) |
 | one_explorer_gets_at_most_two_block_downloads_at_once | Paused time: 20 different blocks from one slow explorer: 2 downloads at a time, all 20 served (d2097ae started 20 at once) |
+| a_walk_round_fetches_at_most_64_headers | Real 330623 with one explorer: each round walks exactly 64 headers with 64 requests |
+| a_height_the_walk_proved_is_never_put_to_a_vote | After the walk, two explorers naming 330622 at 328607 (named by 328608's header) and at 330000: the proven hashes are answered without asking, nobody blamed (c8b7481 took the vote at 328607) |
+| two_stalled_downloads_dont_hold_up_a_third_ready_source | Paused time, three explorers, two stalled on the download: the ready one has the block followed within the 10 s wait plus a second, at most 3 downloads (c8b7481 waited behind both) |
+| many_callers_across_many_explorers_make_at_most_three_downloads_of_a_block | Paused time: 20 `getblock` calls for one block across 5 slow explorers (whose own limits would allow 10) make at most 3 downloads |
 
 ## proofs_fees_limits.rs: proofs, fees, politeness (9)
 | Test | Checks |
@@ -188,7 +198,7 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | a_bad_old_header_marks_its_source_and_the_honest_copy_is_used | A header that doesn't hash to the agreed block marks its source bad |
 | a_lone_dissenter_is_outvoted_for_old_blocks_but_reported | Two votes and a strict majority win; the dissent is still reported |
 | a_chain_block_offered_as_an_old_one_is_refused | A block on our proven chain can't be served as an older height |
-| an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
+| the_checkpoints_parent_is_answered_from_the_checkpoint_not_a_vote | The block below the checkpoint is answered as the parent the checkpoint names, its header fetched by hash; explorers agreeing on another block there aren't even asked (c8b7481 voted first) |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 | an_unknown_method_is_listed_once_on_status_and_still_answers_not_found | An unsupported method still gets -32601; `/status` lists each name once, sorted, batches included |
 | known_methods_never_appear_in_the_unsupported_list | Supported methods are never listed as unsupported |
@@ -220,4 +230,4 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | with_the_signet_check_feature_signet_runs | With the checker built in, a signet node starts and signet's genesis passes |
 | without_the_signet_check_feature_signet_is_refused | Only in `cargo test --lib --no-default-features` (the browser build, as CI runs it): every signet block is refused, a signet node never starts and raises a critical alarm; regtest still works |
 
-**Total: 163 tests** (`cargo test --locked`), plus 1 in the browser build (`cargo test --locked --lib --no-default-features`).
+**Total: 173 tests** (`cargo test --locked`), plus 1 in the browser build (`cargo test --locked --lib --no-default-features`).

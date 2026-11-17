@@ -935,7 +935,7 @@ fn bootstrap_node(sources: &[Arc<FakeSource>], now: u32) -> Node {
     )
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_without_blame() {
     let h608 = header_hex(include_str!("fixtures/signet-328608-header.hex"));
     let h623 = header_hex(include_str!("fixtures/signet-330623-header.hex"));
@@ -981,6 +981,9 @@ async fn a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_with
             st.extra_headers = hs[..2015].iter().map(|h| (h.block_hash(), *h)).collect();
         });
     }
+    // (Past the short wait their "not found" earned: they are asked again
+    // after 5 s, not every round.)
+    tokio::time::advance(trust_issues::limits::BACKOFF_START * 2).await;
     let followed = tick_until(&node, 60, |n| {
         n.with_chain(|c| c.tip_hash()) == b624.block_hash()
     })
@@ -1491,5 +1494,124 @@ async fn one_explorer_gets_at_most_two_block_downloads_at_once() {
         assert!(c.await.unwrap().is_ok());
     }
     assert_eq!(a.with(|s| s.raw_block_calls), 20);
+    assert_eq!(node.in_flight_len(), 0);
+}
+
+// ---------- fourth review (2026-11-17) ----------
+
+#[tokio::test]
+async fn a_walk_round_fetches_at_most_64_headers() {
+    let s = period_source("only", &[]);
+    let node = signet_node(
+        std::slice::from_ref(&s),
+        (330_623, period_headers()[2015].block_hash()),
+        period_headers()[2015].time,
+    );
+    node.start().await.expect("start");
+    s.with(|st| st.header_calls = 0);
+    let per = trust_issues::node::WALK_BACK_PER_TICK;
+    for round in 1..=2 {
+        node.tick().await;
+        assert_eq!(node.with_chain(|c| c.walked_len()), per * round);
+        assert_eq!(s.with(|st| st.header_calls), per * round);
+    }
+}
+
+#[tokio::test]
+async fn a_height_the_walk_proved_is_never_put_to_a_vote() {
+    let hs = period_headers();
+    let (a, b) = (period_source("a", &[]), period_source("b", &[]));
+    let node = signet_node(
+        &[a.clone(), b.clone()],
+        (330_623, hs[2015].block_hash()),
+        hs[2015].time,
+    );
+    node.start().await.expect("start");
+    let walked = tick_until(&node, 40, |n| n.with_chain(|c| c.walk_back_done())).await;
+    assert!(walked);
+    // Both explorers name 330622 (a real header, valid proof of work) as
+    // the block at 328607, which 328608's header names by hash, and at
+    // 330000, which the walk proved. c8b7481 took the vote for 328607.
+    for s in [&a, &b] {
+        s.with(|st| {
+            st.at_height.insert(328_607, hs[2014].block_hash());
+            st.at_height.insert(330_000, hs[2014].block_hash());
+        });
+    }
+    assert_eq!(node.deep_hash_at(328_607).await, Ok(hs[0].prev_blockhash));
+    assert_eq!(
+        node.deep_hash_at(330_000).await,
+        Ok(hs[330_000 - 328_608].block_hash())
+    );
+    // Nobody was asked, so nobody is blamed.
+    assert!(bad_sources(&node).is_empty(), "{:?}", node.alarms());
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_stalled_downloads_dont_hold_up_a_third_ready_source() {
+    let real = block_314();
+    let stalled_1 = signet_source("stalled-1", &real);
+    let stalled_2 = signet_source("stalled-2", &real);
+    let ready = signet_source("ready", &real);
+    for s in [&stalled_1, &stalled_2] {
+        s.with(|st| st.raw_block_delay = Some(std::time::Duration::from_secs(1000)));
+    }
+    let node = Arc::new(signet_node(
+        &[stalled_1.clone(), stalled_2.clone(), ready.clone()],
+        (331_313, header_313().block_hash()),
+        real.header.time,
+    ));
+    node.start().await.expect("start");
+    let n = node.clone();
+    let round = tokio::spawn(async move { n.tick().await });
+    // c8b7481: the first stalled download held the first slot, the second
+    // the one extra slot, and the ready explorer waited behind them.
+    tokio::time::sleep(trust_issues::node::IN_FLIGHT_WAIT + std::time::Duration::from_secs(1))
+        .await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), real.block_hash());
+    let downloads: usize = [&stalled_1, &stalled_2, &ready]
+        .iter()
+        .map(|s| s.with(|st| st.raw_block_calls))
+        .sum();
+    assert!(downloads <= 3, "{downloads}");
+    assert_eq!(ready.with(|st| st.raw_block_calls), 1);
+    round.await.unwrap();
+    assert!(bad_sources(&node).is_empty(), "{:?}", node.alarms());
+    assert_eq!(node.in_flight_len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn many_callers_across_many_explorers_make_at_most_three_downloads_of_a_block() {
+    // Five explorers, so each one's own limit (two downloads at once)
+    // would allow ten: only the per-block limit keeps this at three.
+    let blocks = build_chain(3, 1);
+    let sources: Vec<_> = (0..5)
+        .map(|i| FakeSource::honest(&format!("s{i}"), &blocks))
+        .collect();
+    let (node, _) = started_node(&sources, &blocks).await;
+    for s in &sources {
+        s.with(|st| {
+            st.raw_block_calls = 0;
+            st.raw_block_delay = Some(std::time::Duration::from_secs(15));
+        });
+    }
+    let hash = blocks[2].block_hash();
+    let calls: Vec<_> = (0..20)
+        .map(|_| {
+            let n = node.clone();
+            tokio::spawn(async move { n.get_block(hash).await })
+        })
+        .collect();
+    for c in calls {
+        assert!(c.await.unwrap().is_ok());
+    }
+    let downloads: usize = sources
+        .iter()
+        .map(|s| s.with(|st| st.raw_block_calls))
+        .sum();
+    assert!(
+        downloads <= 1 + trust_issues::node::EXTRA_DOWNLOADS_PER_BLOCK,
+        "{downloads}"
+    );
     assert_eq!(node.in_flight_len(), 0);
 }

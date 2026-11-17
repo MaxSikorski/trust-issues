@@ -173,6 +173,12 @@ pub struct FakeState {
     pub raw_block_calls: usize,
     /// `raw_block` waits this long before answering (a slow download).
     pub raw_block_delay: Option<Duration>,
+    /// How many times `header` was asked.
+    pub header_calls: usize,
+    /// `header` waits this long before answering (a slow explorer).
+    pub header_delay: Option<Duration>,
+    /// `block_hash_at` waits this long before answering.
+    pub hash_at_delay: Option<Duration>,
     /// `raw_block` answers "not found" for these (withholding a block
     /// while showing its header).
     pub withheld_blocks: HashSet<BlockHash>,
@@ -266,6 +272,10 @@ impl Source for FakeSource {
     }
 
     async fn block_hash_at(&self, height: u32) -> Result<BlockHash, SourceError> {
+        let delay = self.state.lock().unwrap().hash_at_delay;
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
         if height == 0
             && let Some(g) = s.genesis_override
@@ -285,6 +295,14 @@ impl Source for FakeSource {
     }
 
     async fn header(&self, hash: BlockHash) -> Result<Header, SourceError> {
+        let delay = {
+            let mut s = self.state.lock().unwrap();
+            s.header_calls += 1;
+            s.header_delay
+        };
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
         if let Some(h) = s.header_lie {
             return Ok(h);

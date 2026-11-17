@@ -721,7 +721,7 @@ async fn a_chain_block_offered_as_an_old_one_is_refused() {
 }
 
 #[tokio::test]
-async fn an_old_answer_that_contradicts_the_checkpoint_is_refused() {
+async fn the_checkpoints_parent_is_answered_from_the_checkpoint_not_a_vote() {
     // Block 9 is provable: our checkpoint (block 10) names its parent.
     let blocks = build_chain(20, 1);
     let other = fork(&blocks, 8, 12, 2);
@@ -730,7 +730,16 @@ async fn an_old_answer_that_contradicts_the_checkpoint_is_refused() {
     let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
     let (_, v) = rpc(&node, "getblockhash", json!([9])).await;
     assert_eq!(v["result"], blocks[9].block_hash().to_string());
-    // Both now agree on a different block 9: still refused.
+    // Its header is fetched by hash for the wallet's next question.
+    let (_, v) = rpc(
+        &node,
+        "getblockheader",
+        json!([blocks[9].block_hash().to_string(), false]),
+    )
+    .await;
+    assert_eq!(v["result"], header_hex(&blocks[9].header));
+    // Both now agree on a different block 9: not asked, the proven
+    // answer stands (c8b7481 voted, then refused the winner).
     let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
     for s in [&a, &b] {
         let mut lie = blocks.clone();
@@ -738,14 +747,12 @@ async fn an_old_answer_that_contradicts_the_checkpoint_is_refused() {
         s.with(|st| st.blocks = lie);
     }
     let (_, v) = rpc(&node, "getblockhash", json!([9])).await;
+    assert_eq!(v["result"], blocks[9].block_hash().to_string());
     assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("checkpoint"),
-        "{v}"
+        !alarm_codes(&node)
+            .iter()
+            .any(|c| c.starts_with("source-bad:") || c == "old-block-disagreement")
     );
-    assert!(alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
 }
 
 #[test]

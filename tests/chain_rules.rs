@@ -700,3 +700,208 @@ fn the_walk_back_is_bounded_by_what_the_rules_need() {
     let regtest = HeaderChain::new(Network::Regtest, 20, blocks[20].header);
     assert!(regtest.walk_back_done());
 }
+
+// ---------- fourth review (2026-11-17) ----------
+
+/// Our tip at 30, on a branch that forked `depth` blocks below it (0: no
+/// fork); then both explorers come back 2017 blocks past our tip on the
+/// other branch. Where the node's tip ends up after a few rounds.
+async fn catch_up_across_a_fork(depth: u32) -> (u32, Vec<bitcoin::Block>) {
+    use std::sync::Arc;
+    let tip = 30;
+    let honest = build_chain(tip + 2017, 1);
+    let ours = if depth == 0 {
+        honest[..=tip as usize].to_vec()
+    } else {
+        fork(&honest, tip - depth, depth, 2)
+    };
+    let (a, b) = (indexed_source("a", &ours), indexed_source("b", &ours));
+    let dyns: Vec<Arc<dyn trust_issues::source::Source>> = [&a, &b]
+        .iter()
+        .map(|s| (*s).clone() as Arc<dyn trust_issues::source::Source>)
+        .collect();
+    let node = trust_issues::node::Node::new(
+        settings(Some((0, genesis().block_hash()))),
+        dyns,
+        Arc::new(trust_issues::node::ManualClock::new(now_after(&honest))),
+    );
+    node.start().await.expect("start");
+    node.tick().await;
+    assert_eq!(
+        node.with_chain(|c| c.tip_hash()),
+        ours[tip as usize].block_hash()
+    );
+    for s in [&a, &b] {
+        s.set_chain(&honest);
+        s.with(|st| {
+            st.extra_headers
+                .extend(honest.iter().map(|b| (b.block_hash(), b.header)));
+        });
+    }
+    for _ in 0..3 {
+        node.tick().await;
+    }
+    assert!(
+        !node.alarms().keys().any(|k| k.starts_with("source-bad:")),
+        "{:?}",
+        node.alarms()
+    );
+    (node.with_chain(|c| c.tip_height()), honest)
+}
+
+#[tokio::test]
+async fn catching_up_more_than_one_walk_works_across_a_fork_below_our_tip() {
+    // c8b7481 stepped from exactly one walk (2016) above our tip, so the
+    // walk back from there ended one header short of a fork one block
+    // below our tip, and did that again every round, for good.
+    for depth in [0, 1, 10] {
+        let (tip, honest) = catch_up_across_a_fork(depth).await;
+        assert_eq!(tip, honest.len() as u32 - 1, "fork {depth} deep");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_explorer_doesnt_hold_up_the_round_and_the_walk_prefers_the_fast_one() {
+    let blocks = slow_chain(20);
+    let slow = indexed_source("slow", &blocks);
+    let fast = indexed_source("fast", &blocks);
+    // Checkpoint at the tip, so only the walk back (19 down to 10) asks
+    // for headers.
+    let node = retargeting_node(&[slow.clone(), fast.clone()], &blocks, 20);
+    node.start().await.expect("start");
+    slow.with(|st| st.header_delay = Some(std::time::Duration::from_secs(89)));
+    // c8b7481 asked the slow one first for about every other header, so a
+    // round took minutes and the fee and broadcast rechecks after the
+    // walk waited for it.
+    for _ in 0..3 {
+        let started = tokio::time::Instant::now();
+        node.tick().await;
+        let took = started.elapsed();
+        assert!(
+            took <= trust_issues::node::WALK_BACK_ROUND_LIMIT + std::time::Duration::from_secs(1),
+            "a round took {took:?}"
+        );
+    }
+    assert!(node.with_chain(|c| c.walk_back_done()));
+    // Asked at most once, then the fast one was preferred.
+    assert!(
+        slow.with(|st| st.header_calls) <= 2,
+        "{}",
+        slow.with(|st| st.header_calls)
+    );
+    assert!(!node.alarms().keys().any(|k| k.starts_with("source-bad:")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_explorer_without_the_old_headers_is_asked_for_them_less_and_less() {
+    let blocks = slow_chain(20);
+    // Both explorers show only block 20 and up: every walk-back header is
+    // "not found". That's not a lie, but it shouldn't cost a request
+    // per explorer every round forever.
+    let make = |name: &str| {
+        let s = FakeSource::honest(name, &blocks[20..]);
+        s.with(|st| {
+            st.height_offset = 20;
+            st.genesis_override = Some(genesis().block_hash());
+        });
+        s
+    };
+    let (a, b) = (make("a"), make("b"));
+    let node = retargeting_node(&[a.clone(), b.clone()], &blocks, 20);
+    node.start().await.expect("start");
+    for s in [&a, &b] {
+        s.with(|st| st.header_calls = 0);
+    }
+    // 30 rounds a minute apart: c8b7481 asked each one 30 times.
+    for _ in 0..30 {
+        node.tick().await;
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    }
+    for s in [&a, &b] {
+        let asked = s.with(|st| st.header_calls);
+        assert!((1..=10).contains(&asked), "{} asked {asked} times", s.name);
+    }
+    assert_eq!(node.with_chain(|c| c.walked_len()), 0);
+    assert!(!node.alarms().keys().any(|k| k.starts_with("source-bad:")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_old_block_vote_is_checked_against_headers_walked_while_it_waited() {
+    let blocks = slow_chain(20);
+    // Another block at 15, with valid proof of work.
+    let other = mine(&blocks[14].header, 15, vec![], 9, REGTEST_BITS);
+    let (a, b) = (indexed_source("a", &blocks), indexed_source("b", &blocks));
+    let node = retargeting_node(&[a.clone(), b.clone()], &blocks, 20);
+    node.start().await.expect("start");
+    // Both explorers name the other block at 15, slowly.
+    for s in [&a, &b] {
+        s.with(|st| {
+            st.at_height.insert(15, other.block_hash());
+            st.extra_headers.insert(other.block_hash(), other.header);
+            st.hash_at_delay = Some(std::time::Duration::from_secs(30));
+        });
+    }
+    // While the lookup waits for their votes, a round walks back past 15:
+    // block 15 is proven by hash. c8b7481 took the vote anyway.
+    let (answer, ()) = tokio::join!(node.deep_hash_at(15), node.tick());
+    assert_eq!(
+        node.with_chain(|c| c.hash_at(15)),
+        Some(blocks[15].block_hash())
+    );
+    assert_eq!(answer, Ok(blocks[15].block_hash()));
+    // Naming another block there is a provable lie.
+    let bad: Vec<String> = node
+        .alarms()
+        .keys()
+        .filter(|k| k.starts_with("source-bad:"))
+        .cloned()
+        .collect();
+    assert_eq!(bad, vec!["source-bad:a", "source-bad:b"]);
+    assert_eq!(node.deep_header(&other.block_hash()), None);
+}
+
+#[test]
+fn the_median_time_rule_uses_the_headers_walked_below_the_checkpoint() {
+    let blocks = slow_chain(30);
+    let now = now_after(&blocks);
+    // Block 21 at exactly the median time of 10..=20 (block 15's time).
+    let early = mine_at(&blocks[20].header, 21, blocks[15].header.time);
+    let mut chain = HeaderChain::with_params(retargeting_regtest(), 20, blocks[20].header);
+    // Only the checkpoint is known: the rule waits.
+    chain.check(&[early.header], now).unwrap();
+    assert_eq!(
+        chain.median_time_past(&blocks[20].block_hash()),
+        blocks[20].header.time
+    );
+    let below: Vec<_> = blocks[10..20].iter().rev().map(|b| b.header).collect();
+    walk(&mut chain, &below);
+    assert!(chain.walk_back_done());
+    // With the ten walked below it, it applies, and the median time we
+    // report counts them too.
+    assert!(matches!(
+        chain.check(&[early.header], now).unwrap_err(),
+        ChainError::TimeTooOld { .. }
+    ));
+    assert_eq!(
+        chain.median_time_past(&blocks[20].block_hash()),
+        blocks[15].header.time
+    );
+}
+
+#[test]
+fn the_median_time_at_a_real_checkpoint_counts_the_walked_headers() {
+    let period: Vec<bitcoin::block::Header> =
+        include_bytes!("fixtures/signet-328608-to-330623-headers.bin")
+            .chunks(80)
+            .map(|c| bitcoin::consensus::encode::deserialize(c).unwrap())
+            .collect();
+    let h623 = period[2015];
+    let mut chain = HeaderChain::new(Network::Signet, 330_623, h623);
+    walk(
+        &mut chain,
+        &period[..2015].iter().rev().copied().collect::<Vec<_>>(),
+    );
+    // Median of 330613..=330623: getblockheader and getblockchaininfo
+    // give this for 330623 (c8b7481 gave 330623's own time).
+    assert_eq!(chain.median_time_past(&h623.block_hash()), 1_794_546_305);
+}

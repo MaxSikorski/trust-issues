@@ -280,11 +280,28 @@ fn write_cookie(dir: &std::path::Path, password: &str) -> Result<std::path::Path
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(".cookie");
     let tmp = dir.join(".cookie.tmp");
-    std::fs::write(&tmp, format!("__cookie__:{password}"))?;
+    // Created at 0600, never readable by others even for a moment (the data
+    // dir may be a shared bind mount). A leftover .tmp from a crash, or
+    // anything planted there, is removed and never written through.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", tmp.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(format!("__cookie__:{password}").as_bytes())?;
+        f.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
     Ok(path)
@@ -409,4 +426,31 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(&cookie_path);
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_cookie;
+
+    #[test]
+    fn the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp() {
+        let dir =
+            std::env::temp_dir().join(format!("trust-issues-cookie-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A leftover from a crash, readable by everyone.
+        std::fs::write(dir.join(".cookie.tmp"), "stale").unwrap();
+        let path = write_cookie(&dir, "abc123").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:abc123");
+        assert!(!dir.join(".cookie.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Written again on the next start: a fresh password, still private.
+        let path = write_cookie(&dir, "def456").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:def456");
+    }
 }

@@ -128,4 +128,9 @@ Two examples are not tests:
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 90 tests.**
+## src/main.rs: the program itself (1)
+| Test | Checks |
+|---|---|
+| the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp | The RPC cookie is created at 0600 (never readable by others, even for a moment) and a leftover `.cookie.tmp` is replaced, not written through |
+
+**Total: 91 tests.**

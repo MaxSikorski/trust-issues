@@ -47,7 +47,7 @@ Two examples are not tests:
 | token_bucket_allows_a_burst_then_the_rate | Burst then rate; asking for more than 2/s is clamped |
 | backoff_doubles_from_five_seconds_to_a_ten_minute_cap | 5, 10, 20 … 600 s, plus jitter |
 
-## config_rules.rs: safety rails (5)
+## config_rules.rs: safety rails (13)
 | Test | Checks |
 |---|---|
 | only_signet_and_regtest_are_allowed | Mainnet, testnet and testnet4 are refused |
@@ -55,6 +55,38 @@ Two examples are not tests:
 | default_signet_config_uses_three_independent_onions_through_tor | The defaults are three onions (mempool.space, Emzy, Blockstream), all via Tor |
 | needs_two_sources_and_respects_the_request_ceiling | At least two sources; no more than 2 requests/s; unknown keys refused |
 | checkpoint_parses_height_and_hash | `height:hash` format |
+| two_sources_on_one_host_and_port_are_one_source_in_the_file_too | Two sources on the same host and port (any path, slash, case, default port, and every loopback spelling: localhost, 127.x.x.x, `[::1]`) are refused, from the file and from the list |
+| syntax_errors_report_only_the_position | A broken config file is reported as line, column and "wrong type or syntax", never its text; a wrong type also names the key and expected type, never the value |
+| the_unspecified_address_is_never_a_source | `0.0.0.0` and `[::]` are refused as sources |
+| urls_that_cannot_be_shown_safely_are_not_shown | Single slash, no scheme, no host, percent-encoded `@`: the URL is never echoed, the source name is |
+| tor_socks_must_be_host_and_port_with_no_login | `user:pw@host:port`, schemes and extra colons are refused without echo; plain hosts and `[::1]` work |
+| source_urls_with_a_login_are_refused_and_never_echoed | `user:password@` in a source URL is refused and never shown in an error |
+| numbers_in_the_file_must_be_finite_and_above_the_floor | `inf`, `nan` and a request rate under 0.01/s are refused |
+| blank_string_overrides_are_refused_by_name | A blank override is an error naming the setting; `tor_socks` must be `host:port` |
+
+## config_env.rs: settings from flags and environment variables (20)
+| Test | Checks |
+|---|---|
+| environment_variables_alone_are_enough | No file needed: network, Tor, bind and data dir from the environment, default onion sources |
+| flags_beat_environment_variables_which_beat_the_file | Precedence: flag, then environment variable, then file |
+| neither_a_flag_nor_an_environment_variable_can_pick_mainnet | Mainnet and testnets are refused from both routes |
+| sources_from_the_environment_follow_the_same_rules | Clearnet, a single source and malformed entries (each next to two good ones) are refused; onion plus a home machine is routed correctly |
+| the_network_must_be_set_somewhere | No network anywhere is an error ("network must be set") |
+| passwords_never_come_from_flags_or_the_environment | `--rpc-user`/`--rpc-password` are clap's unexpected arguments, the env var is ignored, `rpc_auth` never names the user or shows the password |
+| the_old_command_lines_still_work | `health-check --config F [--synced]` still works |
+| health_check_synced_follows_what_the_server_says | Against a loopback `/health`: not synced means `--synced` exits 1, plain exits 0; synced means both exit 0 |
+| the_bare_old_form_works_with_the_flag_on_either_side | `--config F check-config` and `check-config --config F` |
+| a_repeated_config_flag_is_refused_and_a_dash_name_is_allowed | Two real `--config` flags (either form, either side of the subcommand) are refused; files named `-dash.toml` or `--config` work |
+| syntax_errors_never_echo_the_file | An unterminated password, a cookie file and a wrong type never appear in the error |
+| check_config_names_no_user_and_sources_carry_no_login | `rpc_auth` line without the user name; logins in source URLs refused; `--help` shows no environment values |
+| numbers_must_be_finite_and_requests_must_reach_the_limiters_floor | `1e309`, `inf`, `nan`, rates under 0.01 or over 2 refused, with the setting named |
+| a_blank_value_never_overrides_the_file_and_tor_must_be_host_and_port | Empty or blank values for every setting are errors; bad `tor_socks` refused; stray whitespace trimmed |
+| only_the_winning_number_is_parsed | A bad environment number doesn't break a flag that beats it |
+| spaces_inside_a_sources_entry_are_refused | Whitespace in a name or URL is an error, not folded into the URL |
+| duplicate_sources_are_refused_from_flags_and_the_environment | The same host and port twice is refused; another port is fine |
+| a_password_in_the_environment_is_ignored_loudly_and_never_echoed | Warning on stderr naming the variable, never its value |
+| a_url_that_cannot_be_shown_safely_is_never_echoed | Malformed source URLs with a login (env and file) never appear in the output |
+| a_tor_address_with_a_login_is_refused_and_never_printed | `tor_socks` with `user:pw@` is refused from env and file, never printed |
 
 ## adversarial.rs: lying, hiding and failing sources (16)
 | Test | Checks |
@@ -101,4 +133,10 @@ Two examples are not tests:
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 67 tests.**
+## src/main.rs: the program itself (2)
+| Test | Checks |
+|---|---|
+| the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp | The RPC cookie is created at 0600 (never readable by others, even for a moment) and a leftover `.cookie.tmp` is replaced; cleans up after itself |
+| a_planted_symlink_at_the_tmp_name_is_never_written_through | A symlink planted at `.cookie.tmp` is replaced and the file it points at stays untouched |
+
+**Total: 97 tests.**

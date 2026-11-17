@@ -21,6 +21,7 @@ server = [
     "dep:base64",
     "dep:getrandom",
     "dep:anyhow",
+    "dep:clap",
     "dep:tracing-subscriber",
 ]
 
@@ -45,6 +46,7 @@ base64 = { version = "0.22", optional = true }
 getrandom = { version = "0.3", optional = true }
 async-trait = "0.1"
 anyhow = { version = "1", optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }

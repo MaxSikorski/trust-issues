@@ -1,13 +1,17 @@
-//! `trust-issues --config <file>`: run the stand-in bitcoind.
-//! `trust-issues health-check --config <file> [--synced]`: ask a running one
-//! whether it's up (and synced), for Docker's HEALTHCHECK and scripts.
+//! `trust-issues [--config <file>] [flags]`: run the stand-in bitcoind.
+//! `trust-issues health-check [--synced]`: ask a running one whether it's up
+//! (and synced), for Docker's HEALTHCHECK and scripts.
+//! `trust-issues check-config`: print the settings and exit.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing::{info, warn};
-use trust_issues::config::parse_config;
+use trust_issues::config::{Config, Overrides, Route, load_config};
 use trust_issues::esplora::EsploraSource;
 use trust_issues::limits::{DEFAULT_BURST, os_jitter};
 use trust_issues::node::{Node, Settings, SystemClock};
@@ -15,10 +19,207 @@ use trust_issues::rpc::{Auth, router};
 use trust_issues::source::Source;
 use trust_issues::systemd;
 
-fn usage() -> ! {
-    eprintln!("usage: trust-issues --config <file.toml>");
-    eprintln!("       trust-issues health-check --config <file.toml> [--synced]");
-    std::process::exit(2);
+/// Settings come from these flags, then `TRUST_ISSUES_*` variables, then the
+/// config file. The RPC user and password are file-only on purpose.
+#[derive(Parser)]
+#[command(
+    version,
+    about = "A stand-in bitcoind that reads the chain from block explorers over Tor"
+)]
+struct Cli {
+    /// signet (or regtest for tests)
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_NETWORK",
+        hide_env_values = true
+    )]
+    network: Option<String>,
+    /// Address of Tor's SOCKS port, like 127.0.0.1:9050
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_TOR_SOCKS",
+        hide_env_values = true
+    )]
+    tor_socks: Option<String>,
+    /// Where the RPC listens, like 127.0.0.1:38332
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_RPC_BIND",
+        hide_env_values = true
+    )]
+    rpc_bind: Option<String>,
+    /// Where the cookie file goes
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_DATA_DIR",
+        hide_env_values = true
+    )]
+    data_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_POLL_INTERVAL_SECS",
+        hide_env_values = true
+    )]
+    poll_interval_secs: Option<String>,
+    /// "<height>:<block hash>"
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_CHECKPOINT",
+        hide_env_values = true
+    )]
+    checkpoint: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_REQUESTS_PER_SEC",
+        hide_env_values = true
+    )]
+    requests_per_sec: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_FEE_CEILING_SAT_VB",
+        hide_env_values = true
+    )]
+    fee_ceiling_sat_vb: Option<String>,
+    /// name=url,name=url (replaces the file's sources)
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_SOURCES",
+        hide_env_values = true
+    )]
+    sources: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Ask a running server whether it's up (for Docker's HEALTHCHECK)
+    HealthCheck {
+        /// Also require it to be synced
+        #[arg(long)]
+        synced: bool,
+    },
+    /// Read and check the settings, print them, and exit (no network)
+    CheckConfig,
+}
+
+/// The `--config` flag, added to the program and to each subcommand so that
+/// clap keeps what was typed in each place instead of letting the last win.
+fn config_arg() -> clap::Arg {
+    clap::Arg::new("config")
+        .long("config")
+        .value_name("CONFIG")
+        .help("Optional config file (TOML)")
+        .env("TRUST_ISSUES_CONFIG")
+        .hide_env_values(true)
+        .allow_hyphen_values(true)
+        .action(clap::ArgAction::Append)
+        .value_parser(clap::value_parser!(PathBuf))
+}
+
+fn command() -> clap::Command {
+    Cli::command()
+        .arg(config_arg())
+        .mut_subcommand("check-config", |s| s.arg(config_arg()))
+        .mut_subcommand("health-check", |s| s.arg(config_arg()))
+}
+
+/// The config file named on the command line, else in the environment.
+/// Refuses two `--config` flags. Only the places clap parsed as the flag count,
+/// so a file that is itself named `--config` is just a value.
+fn config_path(m: &ArgMatches) -> Result<Option<PathBuf>> {
+    let from_flag = |m: &ArgMatches| -> Vec<PathBuf> {
+        if m.value_source("config") == Some(clap::parser::ValueSource::CommandLine) {
+            m.get_many::<PathBuf>("config")
+                .map(|v| v.cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut flags = from_flag(m);
+    if let Some((_, sub)) = m.subcommand() {
+        flags.extend(from_flag(sub));
+    }
+    if flags.len() > 1 {
+        bail!("--config was given more than once; pass one config file");
+    }
+    Ok(flags
+        .pop()
+        .or_else(|| m.get_one::<PathBuf>("config").cloned()))
+}
+
+fn load(cli: &Cli, matches: &ArgMatches) -> Result<Config> {
+    let text = match config_path(matches)? {
+        Some(p) => {
+            Some(std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?)
+        }
+        None => None,
+    };
+    let o = Overrides {
+        network: cli.network.clone(),
+        tor_socks: cli.tor_socks.clone(),
+        rpc_bind: cli.rpc_bind.clone(),
+        data_dir: cli.data_dir.clone(),
+        poll_interval_secs: cli.poll_interval_secs.clone(),
+        checkpoint: cli.checkpoint.clone(),
+        requests_per_sec: cli.requests_per_sec.clone(),
+        fee_ceiling_sat_vb: cli.fee_ceiling_sat_vb.clone(),
+        sources: cli.sources.clone(),
+    };
+    load_config(text.as_deref(), &o).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Print the settings that would be used. Never the password.
+fn print_config(cfg: &Config) {
+    println!("network: {}", cfg.network);
+    println!("rpc_bind: {}", cfg.rpc_bind);
+    println!("data_dir: {}", cfg.data_dir.display());
+    println!("poll_interval_secs: {}", cfg.poll_interval_secs);
+    match &cfg.checkpoint {
+        Some((h, hash)) => println!("checkpoint: {h}:{hash}"),
+        None => println!("checkpoint: none"),
+    }
+    println!("requests_per_sec: {}", cfg.requests_per_sec);
+    println!("fee_ceiling_sat_vb: {}", cfg.fee_ceiling_sat_vb);
+    // Whether, never who: the user name is as private as the password.
+    println!(
+        "rpc_auth: {}",
+        match (&cfg.rpc_user, &cfg.rpc_password) {
+            (Some(_), Some(_)) => "user and password set in the file",
+            (Some(_), None) => "user set in the file (no password)",
+            (None, Some(_)) => "password set in the file (no user)",
+            (None, None) => "cookie only",
+        }
+    );
+    println!("sources:");
+    for s in &cfg.sources {
+        match &s.route {
+            Route::Tor(socks) => println!("  {} {} via Tor at {socks}", s.name, s.url),
+            Route::Direct => println!("  {} {} directly", s.name, s.url),
+        }
+    }
+}
+
+/// The RPC user and password are file-only; say so if someone tried the
+/// environment, which `docker inspect` would expose. Names only, never values.
+fn warn_ignored_credentials() {
+    for var in ["TRUST_ISSUES_RPC_PASSWORD", "TRUST_ISSUES_RPC_USER"] {
+        if std::env::var_os(var).is_some() {
+            eprintln!(
+                "warning: {var} is ignored on purpose (the environment is visible to docker inspect); use the config file or the cookie"
+            );
+        }
+    }
 }
 
 /// Ask the running server on this machine for `GET /health`. Exits 0 when
@@ -108,11 +309,28 @@ fn write_cookie(dir: &std::path::Path, password: &str) -> Result<std::path::Path
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(".cookie");
     let tmp = dir.join(".cookie.tmp");
-    std::fs::write(&tmp, format!("__cookie__:{password}"))?;
+    // Created at 0600, never readable by others even for a moment (the data
+    // dir may be a shared bind mount). A leftover .tmp from a crash, or
+    // anything planted there, is removed and never written through.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", tmp.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        use std::io::Write;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(format!("__cookie__:{password}").as_bytes())?;
+        f.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
     Ok(path)
@@ -127,21 +345,26 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let (path, health, require_synced) = match args.as_slice() {
-        [_, flag, p] if flag == "--config" => (p.clone(), false, false),
-        [_, cmd, flag, p] if cmd == "health-check" && flag == "--config" => {
-            (p.clone(), true, false)
+    let matches = command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    if !matches!(cli.command, Some(Command::HealthCheck { .. })) {
+        warn_ignored_credentials();
+    }
+    let cfg = match load(&cli, &matches) {
+        Ok(c) => c,
+        Err(e) if matches!(cli.command, Some(Command::CheckConfig)) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
         }
-        [_, cmd, flag, p, s] if cmd == "health-check" && flag == "--config" && s == "--synced" => {
-            (p.clone(), true, true)
-        }
-        _ => usage(),
+        Err(e) => return Err(e),
     };
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-    let cfg = parse_config(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if health {
-        health_check(cfg.rpc_bind, require_synced).await;
+    match cli.command {
+        Some(Command::CheckConfig) => {
+            print_config(&cfg);
+            return Ok(());
+        }
+        Some(Command::HealthCheck { synced }) => health_check(cfg.rpc_bind, synced).await,
+        None => {}
     }
     if !cfg.rpc_bind.ip().is_loopback() {
         warn!(bind = %cfg.rpc_bind, "RPC is listening beyond this machine; keep it on a private network");
@@ -233,4 +456,65 @@ async fn main() -> Result<()> {
     let _ = std::fs::remove_file(&cookie_path);
     info!("stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_cookie;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trust-issues-cookie-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp() {
+        let dir = scratch("stale");
+        // A leftover from a crash, readable by everyone.
+        std::fs::write(dir.join(".cookie.tmp"), "stale").unwrap();
+        let path = write_cookie(&dir, "abc123").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:abc123");
+        assert!(!dir.join(".cookie.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Written again on the next start: a fresh password, still private.
+        let path = write_cookie(&dir, "def456").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:def456");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The old code wrote through whatever sat at `.cookie.tmp`. A planted
+    /// symlink must be replaced, and the file it points at left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_the_tmp_name_is_never_written_through() {
+        let dir = scratch("symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "precious").unwrap();
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join(".cookie.tmp")).unwrap();
+        let path = write_cookie(&data, "abc123").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:abc123");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

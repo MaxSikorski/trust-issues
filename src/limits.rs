@@ -6,6 +6,8 @@ use crate::time::Instant;
 
 /// The most requests per second any source may get, whatever the config says.
 pub const HARD_MAX_REQUESTS_PER_SEC: f64 = 2.0;
+/// The slowest rate the bucket will run at; anything lower is clamped up to it.
+pub const MIN_REQUESTS_PER_SEC: f64 = 0.01;
 pub const DEFAULT_REQUESTS_PER_SEC: f64 = 1.0;
 pub const DEFAULT_BURST: f64 = 5.0;
 
@@ -20,7 +22,7 @@ pub struct TokenBucket {
 
 impl TokenBucket {
     pub fn new(rate_per_sec: f64, burst: f64, now: Instant) -> Self {
-        let rate = rate_per_sec.clamp(0.01, HARD_MAX_REQUESTS_PER_SEC);
+        let rate = rate_per_sec.clamp(MIN_REQUESTS_PER_SEC, HARD_MAX_REQUESTS_PER_SEC);
         let capacity = burst.max(1.0);
         Self {
             capacity,

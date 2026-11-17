@@ -73,7 +73,7 @@ cargo build --locked --release
 ./target/release/trust-issues --config examples/signet.toml
 ```
 
-Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_dir>/.cookie`, `bitcoind.rpcpolling=true`) or Core Lightning (`bitcoin-rpcconnect`, `bitcoin-rpcport=38332`, `bitcoin-datadir`) at it. To be honest, **I haven't run either of them against it yet.** That's the next milestone.
+Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_dir>/.cookie`, `bitcoind.rpcpolling=true`) or Core Lightning (`bitcoin-rpcconnect`, `bitcoin-rpcport=38332`, `bitcoin-datadir`) at it. **Both have now run against it on signet:** Core Lightning v26.06.10 synced, received faucet coins and sent a payment through it (Trust Issues sent the transaction to every explorer at once). LND v0.21.8 started and was catching up on old blocks. Opening a channel between them is next.
 
 **Sources:** by default it uses three explorers over their onions: mempool.space, [Emzy's mempool](https://mempool.emzy.de) (a separate, community-run instance) and Blockstream. Blockstream's keyless API allows 700 requests an hour per IP, and through their onion every Tor user shares that, so it's rate-limited most of the time; the other two do the work. You can add a self-hosted Esplora on your own network too.
 

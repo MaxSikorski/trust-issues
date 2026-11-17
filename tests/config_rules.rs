@@ -3,8 +3,8 @@
 
 use bitcoin::Network;
 use trust_issues::config::{
-    BLOCKSTREAM_ONION, ConfigError, MEMPOOL_ONION, Route, parse_checkpoint, parse_config,
-    parse_network, route_for,
+    BLOCKSTREAM_ONION, ConfigError, EMZY_ONION, MEMPOOL_ONION, Route, parse_checkpoint,
+    parse_config, parse_network, route_for,
 };
 
 #[test]
@@ -51,7 +51,7 @@ fn onions_go_through_tor_and_clearnet_is_refused() {
 }
 
 #[test]
-fn default_signet_config_uses_both_onions_through_tor() {
+fn default_signet_config_uses_three_independent_onions_through_tor() {
     let cfg = parse_config("network = \"signet\"\ntor_socks = \"127.0.0.1:9050\"\n").unwrap();
     assert_eq!(cfg.network, Network::Signet);
     assert_eq!(cfg.rpc_bind.to_string(), "127.0.0.1:38332");
@@ -60,6 +60,7 @@ fn default_signet_config_uses_both_onions_through_tor() {
         urls,
         vec![
             format!("{MEMPOOL_ONION}/signet/api"),
+            format!("{EMZY_ONION}/signet/api"),
             format!("{BLOCKSTREAM_ONION}/signet/api")
         ]
     );

@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
+use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid};
@@ -132,9 +133,62 @@ async fn handle_rpc(State(s): State<AppState>, headers: HeaderMap, body: Bytes) 
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
-        value.to_string(),
+        to_core_json(&value),
     )
         .into_response()
+}
+
+/// Fields Bitcoin Core prints as BTC amounts.
+const AMOUNT_KEYS: &[&str] = &[
+    "value",
+    "feerate",
+    "relayfee",
+    "incrementalfee",
+    "mempoolminfee",
+    "minrelaytxfee",
+    "incrementalrelayfee",
+    "total_fee",
+];
+
+/// JSON text the way Bitcoin Core writes it: amounts always with exactly 8
+/// decimals (`0.00001000`, not `0.00001`). Core Lightning's `bcli` parses
+/// amounts strictly and refuses any other form.
+pub fn to_core_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_core_json(v, false, &mut out);
+    out
+}
+
+fn write_core_json(v: &Value, amount: bool, out: &mut String) {
+    match v {
+        Value::Number(n) if amount => match n.as_f64() {
+            Some(f) => out.push_str(&format!("{f:.8}")),
+            None => out.push_str(&n.to_string()),
+        },
+        Value::Array(items) => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_core_json(x, false, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, x)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                write_core_json(x, AMOUNT_KEYS.contains(&k.as_str()), out);
+            }
+            out.push('}');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// Handle one HTTP body: a single request or a batch. Public so tests can
@@ -303,15 +357,36 @@ pub async fn dispatch(node: &Node, method: &str, params: &Value) -> Result<Value
         "getblockhash" => {
             let height = req_u64(params, 0, "height")?;
             let height = u32::try_from(height).map_err(|_| bad_param("height"))?;
-            node.with_chain(|c| c.hash_at(height))
+            if let Some(h) = node.with_chain(|c| c.hash_at(height)) {
+                return Ok(json!(h.to_string()));
+            }
+            if height > node.with_chain(|c| c.tip_height()) {
+                return Err(RpcError::new(
+                    RPC_INVALID_PARAMETER,
+                    "Block height out of range",
+                ));
+            }
+            // Below our checkpoint: cross-checked across sources, not proven.
+            node.deep_hash_at(height)
+                .await
                 .map(|h| json!(h.to_string()))
-                .ok_or_else(|| RpcError::new(RPC_INVALID_PARAMETER, "Block height out of range"))
         }
         "getblockheader" => {
             let hash: BlockHash = req_parse(params, 0, "blockhash")?;
             let verbose = verbosity(params, 1, "verbose", 1) != 0;
             let Some(h) = node.with_chain(|c| c.header(&hash)) else {
-                return Err(RpcError::new(RPC_NOT_FOUND, "Block not found"));
+                // An old block a wallet looked up by height (below the checkpoint).
+                let genesis = bitcoin::constants::genesis_block(node.network()).header;
+                let Some((height, h)) = node
+                    .deep_header(&hash)
+                    .or((hash == genesis.block_hash()).then_some((0, genesis)))
+                else {
+                    return Err(RpcError::new(RPC_NOT_FOUND, "Block not found"));
+                };
+                if !verbose {
+                    return Ok(json!(header_hex(&h)));
+                }
+                return Ok(deep_header_json(node, &hash, height, &h));
             };
             if verbose {
                 Ok(header_json(node, &hash, None))
@@ -350,7 +425,10 @@ pub async fn dispatch(node: &Node, method: &str, params: &Value) -> Result<Value
                                 "No such transaction found in the provided block",
                             )
                         })?;
-                    let height = node.with_chain(|c| c.height_of(&bh)).unwrap_or(0);
+                    let height = node
+                        .with_chain(|c| c.height_of(&bh))
+                        .or_else(|| node.deep_header(&bh).map(|(h, _)| h))
+                        .unwrap_or(0);
                     (tx, Some((bh, height)))
                 }
                 None => node.get_tx(txid).await?,
@@ -462,9 +540,7 @@ pub async fn dispatch(node: &Node, method: &str, params: &Value) -> Result<Value
             "networkhashps": 0, "pooledtx": node.our_mempool().len(),
             "chain": chain_name(node.network()), "warnings": warnings(node),
         })),
-        "getdeploymentinfo" => Ok(
-            json!({"hash": node.with_chain(|c| c.tip_hash().to_string()), "height": node.with_chain(|c| c.tip_height()), "deployments": {}}),
-        ),
+        "getdeploymentinfo" => Ok(deployment_info(node)),
         _ => Err(RpcError::new(RPC_METHOD_NOT_FOUND, "Method not found")),
     }
 }
@@ -525,6 +601,39 @@ fn peer_info(node: &Node) -> Value {
     Value::Array(peers)
 }
 
+/// `getdeploymentinfo`, the way Bitcoin Core reports it. These are the
+/// network's fixed consensus rules, not something we measured: on signet and
+/// regtest every soft fork up to and including taproot is enforced from the
+/// first blocks (Core's chainparams), so they're all "buried" and active.
+/// Lightning asks this to check the backend understands taproot (LND
+/// v0.21's `backendSupportsTaproot`). We don't validate scripts ourselves;
+/// the explorers' own bitcoinds do, and they enforce these same rules.
+fn deployment_info(node: &Node) -> Value {
+    let (bip34, segwit) = match node.network() {
+        Network::Regtest => (1, 0),
+        _ => (1, 1),
+    };
+    let buried = |height: u32| json!({"type": "buried", "active": true, "height": height});
+    node.with_chain(|c| {
+        json!({
+            "hash": c.tip_hash().to_string(),
+            "height": c.tip_height(),
+            "script_flags": [
+                "P2SH", "DERSIG", "NULLDUMMY", "CHECKLOCKTIMEVERIFY",
+                "CHECKSEQUENCEVERIFY", "WITNESS", "TAPROOT"
+            ],
+            "deployments": {
+                "bip34": buried(bip34),
+                "bip66": buried(1),
+                "bip65": buried(1),
+                "csv": buried(1),
+                "segwit": buried(segwit),
+                "taproot": buried(0),
+            },
+        })
+    })
+}
+
 fn blockchain_info(node: &Node) -> Value {
     let synced = node.is_synced();
     let progress = if !node.is_ready() {
@@ -555,7 +664,37 @@ fn blockchain_info(node: &Node) -> Value {
     })
 }
 
+/// Header JSON for an old block below the checkpoint (cross-checked, see
+/// `Node::deep_hash_at`). No chainwork or median time: we don't hold the
+/// headers around it. Confirmations are 0: two sources agree it's there,
+/// but we haven't proven it links to our chain.
+fn deep_header_json(_node: &Node, hash: &BlockHash, height: u32, h: &Header) -> Value {
+    json!({
+        "hash": hash.to_string(),
+        "confirmations": 0,
+        "height": height,
+        "version": h.version.to_consensus(),
+        "versionHex": format!("{:08x}", h.version.to_consensus()),
+        "merkleroot": h.merkle_root.to_string(),
+        "time": h.time,
+        "nonce": h.nonce,
+        "bits": format!("{:08x}", h.bits.to_consensus()),
+        "difficulty": h.difficulty_float(),
+        "previousblockhash": h.prev_blockhash.to_string(),
+    })
+}
+
 fn header_json(node: &Node, hash: &BlockHash, n_tx: Option<usize>) -> Value {
+    // Proven beats cross-checked: the chain is asked first.
+    if node.with_chain(|c| c.header(hash)).is_none()
+        && let Some((height, h)) = node.deep_header(hash)
+    {
+        let mut v = deep_header_json(node, hash, height, &h);
+        if let Some(n) = n_tx {
+            v["nTx"] = json!(n);
+        }
+        return v;
+    }
     node.with_chain(|c| {
         let Some(h) = c.header(hash) else {
             return Value::Null;

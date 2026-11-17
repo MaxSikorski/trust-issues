@@ -17,6 +17,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid};
 use serde_json::{Value, json};
+use tracing::{debug, warn};
 
 use crate::fees;
 use crate::node::{
@@ -191,6 +192,12 @@ fn write_core_json(v: &Value, amount: bool, out: &mut String) {
     }
 }
 
+/// Most requests accepted in one batch. LND, Core Lightning's `bcli` and
+/// LDK's `lightning-block-sync` send single requests (or a handful at most);
+/// the cap stops one login from turning a 2 MiB body into tens of thousands
+/// of calls and log lines.
+pub const MAX_BATCH: usize = 256;
+
 /// Handle one HTTP body: a single request or a batch. Public so tests can
 /// drive it without a socket.
 pub async fn process_body(node: &Node, body: &[u8]) -> (StatusCode, Value) {
@@ -207,6 +214,16 @@ pub async fn process_body(node: &Node, body: &[u8]) -> (StatusCode, Value) {
         }
     };
     match parsed {
+        Value::Array(reqs) if reqs.len() > MAX_BATCH => (
+            StatusCode::BAD_REQUEST,
+            reply(
+                Value::Null,
+                Err(RpcError::new(
+                    RPC_INVALID_REQUEST,
+                    format!("Batch too large: at most {MAX_BATCH} requests"),
+                )),
+            ),
+        ),
         Value::Array(reqs) => {
             let mut out = Vec::with_capacity(reqs.len());
             for r in reqs {
@@ -233,7 +250,18 @@ async fn process_one(node: &Node, req: Value) -> (StatusCode, Value) {
         );
     };
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
+    let clean_method = crate::source::clean_text(method);
+    debug!(method = %clean_method, "rpc call");
+    // "Unsupported" is decided from our own list, before dispatch, so neither
+    // an upstream error code nor warm-up can change it.
+    let unsupported = !SUPPORTED.contains(&method);
     let result = dispatch(node, method, &params).await;
+    if unsupported && node.note_unsupported_rpc(&clean_method) {
+        warn!(
+            method = %clean_method,
+            "a client asked for an RPC method Trust Issues doesn't support yet"
+        );
+    }
     let status = match &result {
         Ok(_) => StatusCode::OK,
         Err(e) if e.code == RPC_METHOD_NOT_FOUND => StatusCode::NOT_FOUND,

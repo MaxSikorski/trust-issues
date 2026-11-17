@@ -426,7 +426,8 @@ async fn old_blocks_below_the_checkpoint_are_answered_when_sources_agree() {
     assert_eq!(v["error"]["code"], -8);
 }
 
-#[tokio::test]
+// Paused time: the missing source is retried after its backoff.
+#[tokio::test(start_paused = true)]
 async fn old_blocks_fail_closed_when_sources_disagree_or_only_one_answers() {
     let blocks = build_chain(20, 1);
     let other = fork(&blocks, 3, 17, 2);
@@ -451,6 +452,192 @@ async fn old_blocks_fail_closed_when_sources_disagree_or_only_one_answers() {
     c.with(|s| s.fail = Some(SourceError::Transport("down".into())));
     let (_, v) = rpc(&node, "getblockhash", json!([6])).await;
     assert!(v["result"].is_null(), "{v}");
+}
+
+fn calls(s: &FakeSource) -> usize {
+    s.with(|st| st.calls)
+}
+
+// The live LND rescan on 2026-11-17 stalled for hours because one of the two
+// working explorers missed a single old-block lookup and LND never asked
+// again. A missed source is now asked once more, after its own backoff.
+#[tokio::test(start_paused = true)]
+async fn a_missed_old_block_lookup_is_retried_once_after_its_backoff() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    let (a0, b0) = (calls(&a), calls(&b));
+    b.with(|s| {
+        s.fail_next
+            .push_back(SourceError::Transport("circuit closed".into()))
+    });
+    let started = tokio::time::Instant::now();
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert_eq!(v["result"], blocks[5].block_hash().to_string(), "{v}");
+    assert!(
+        started.elapsed() >= trust_issues::limits::BACKOFF_START,
+        "the retry waited out b's backoff instead of hammering it"
+    );
+    // b: the miss and the retry. a: its answer and the header.
+    assert_eq!(calls(&b) - b0, 2);
+    assert_eq!(calls(&a) - a0, 2);
+    assert!(!alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_old_block_lookup_is_retried_only_once_then_fails_closed() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    let b0 = calls(&b);
+    b.with(|s| {
+        for _ in 0..2 {
+            s.fail_next
+                .push_back(SourceError::Transport("circuit closed".into()));
+        }
+    });
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "one answer is never enough: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("fewer than two")
+    );
+    assert_eq!(calls(&b) - b0, 2, "one retry, not a loop");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_long_retry_after_is_respected_and_not_waited_out() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    let b0 = calls(&b);
+    b.with(|s| {
+        s.fail_next.push_back(SourceError::RateLimited {
+            retry_after: Some(600),
+        })
+    });
+    let started = tokio::time::Instant::now();
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "{v}");
+    assert_eq!(calls(&b) - b0, 1, "no request before its Retry-After");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a ten-minute wait isn't held inside one RPC call"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_after_of_exactly_the_cap_is_waited_out_then_retried() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a, b.clone()], &blocks).await;
+    let cap = trust_issues::node::OLD_BLOCK_RETRY_MAX_WAIT;
+    b.with(|s| {
+        s.fail_next.push_back(SourceError::RateLimited {
+            retry_after: Some(cap.as_secs()),
+        })
+    });
+    let started = tokio::time::Instant::now();
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert_eq!(v["result"], blocks[5].block_hash().to_string(), "{v}");
+    assert!(started.elapsed() >= cap, "not asked before its Retry-After");
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_of_four_is_not_a_majority_for_old_blocks() {
+    // Two honest sources and two liars on two different histories: a 2-1-1
+    // split is a plurality, not a majority, so it's refused.
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let d = FakeSource::honest("d", &blocks);
+    let node = node_from_block_10(&[a, b, c.clone(), d.clone()], &blocks).await;
+    c.with(|s| s.blocks = fork(&blocks, 3, 17, 2));
+    d.with(|s| s.blocks = fork(&blocks, 3, 17, 3));
+    // Four lookups start at each of the four rotation points: once with the
+    // two honest sources first (they agree; done), three times with a split.
+    let mut answered = 0;
+    let mut refused = 0;
+    for h in 4..8u32 {
+        let (_, v) = rpc(&node, "getblockhash", json!([h])).await;
+        if v["result"].is_null() {
+            assert!(v["error"]["message"].as_str().unwrap().contains("disagree"));
+            refused += 1;
+        } else {
+            assert_eq!(v["result"], blocks[h as usize].block_hash().to_string());
+            answered += 1;
+        }
+    }
+    assert_eq!((answered, refused), (1, 3));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_arent_cut_short_while_an_answer_could_still_change_the_outcome() {
+    // a and c tell the truth, b and d another history; c and d each miss
+    // once. Whatever order the retries come back in, it ends 2-2: refused,
+    // never the liars' block on a 2-1 count taken too early.
+    let blocks = build_chain(20, 1);
+    let other = fork(&blocks, 3, 17, 2);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let d = FakeSource::honest("d", &blocks);
+    let node = node_from_block_10(&[a, b.clone(), c.clone(), d.clone()], &blocks).await;
+    for s in [&b, &d] {
+        s.with(|st| st.blocks = other.clone());
+    }
+    for h in 4..8u32 {
+        for s in [&c, &d] {
+            s.with(|st| {
+                st.fail_next
+                    .push_back(SourceError::Transport("circuit closed".into()))
+            });
+        }
+        let (_, v) = rpc(&node, "getblockhash", json!([h])).await;
+        assert!(v["result"].is_null(), "height {h}: {v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("disagree"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sources_that_stop_answering_dont_clear_a_disagreement_alarm() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let c = FakeSource::honest("c", &blocks);
+    let node = node_from_block_10(&[a.clone(), c.clone()], &blocks).await;
+    c.with(|s| s.blocks = fork(&blocks, 3, 17, 2));
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "{v}");
+    assert!(alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
+    for s in [&a, &c] {
+        s.with(|st| st.fail = Some(SourceError::Transport("down".into())));
+    }
+    let (_, v) = rpc(&node, "getblockhash", json!([6])).await;
+    assert!(v["result"].is_null(), "{v}");
+    assert!(
+        alarm_codes(&node).contains(&"old-block-disagreement".to_string()),
+        "silence isn't agreement"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn not_found_for_an_old_block_is_an_answer_and_not_retried() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let b = FakeSource::honest("b", &blocks);
+    let node = node_from_block_10(&[a.clone(), b.clone()], &blocks).await;
+    let b0 = calls(&b);
+    b.with(|s| s.fail_next.push_back(SourceError::NotFound));
+    let (_, v) = rpc(&node, "getblockhash", json!([5])).await;
+    assert!(v["result"].is_null(), "{v}");
+    assert_eq!(calls(&b) - b0, 1);
 }
 
 #[tokio::test]

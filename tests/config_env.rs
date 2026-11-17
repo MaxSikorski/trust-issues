@@ -20,10 +20,26 @@ fn bin() -> Command {
     c
 }
 
-fn file(name: &str, text: &str) -> PathBuf {
+/// A fixture file that removes itself when the test ends.
+struct Fixture(PathBuf);
+
+impl AsRef<std::ffi::OsStr> for Fixture {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One file per test name (every test passes its own), under the target folder.
+fn file(name: &str, text: &str) -> Fixture {
     let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("config_env_{name}.toml"));
     std::fs::write(&p, text).unwrap();
-    p
+    Fixture(p)
 }
 
 fn out(o: &Output) -> String {
@@ -330,18 +346,46 @@ fn a_repeated_config_flag_is_refused_and_a_dash_name_is_allowed() {
         .unwrap();
     assert!(!o.status.success(), "{}", out(&o));
     assert!(out(&o).contains("more than once"), "{}", out(&o));
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    std::fs::write(
-        dir.join("-dash.toml"),
-        "network = \"signet\"\ntor_socks = \"127.0.0.1:9050\"\n",
-    )
-    .unwrap();
+    // `--config=a --config=b` is two flags too.
     let o = bin()
-        .current_dir(&dir)
-        .args(["check-config", "--config", "-dash.toml"])
+        .arg(format!("--config={}", a.0.display()))
+        .arg("check-config")
+        .arg(format!("--config={}", b.0.display()))
         .output()
         .unwrap();
-    assert!(o.status.success(), "{}", out(&o));
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("more than once"), "{}", out(&o));
+    // A file literally named like the flag is a value, not a second flag.
+    let dir = std::env::temp_dir().join(format!("trust-issues-dashname-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["-dash.toml", "--config"] {
+        std::fs::write(
+            dir.join(name),
+            "network = \"signet\"\ntor_socks = \"127.0.0.1:9050\"\n",
+        )
+        .unwrap();
+        let o = bin()
+            .current_dir(&dir)
+            .args(["check-config", "--config", name])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{name}: {}", out(&o));
+    }
+    // ... and the flag, then that file, then a real second flag is refused.
+    let o = bin()
+        .current_dir(&dir)
+        .args([
+            "--config",
+            "--config",
+            "check-config",
+            "--config",
+            "-dash.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("more than once"), "{}", out(&o));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -372,10 +416,14 @@ fn syntax_errors_never_echo_the_file() {
             out(&o)
         );
         assert!(
-            out(&o).contains("syntax error at line"),
+            out(&o).contains("wrong type or syntax"),
             "{name}: {}",
             out(&o)
         );
+        if name == "wrong_type" {
+            let t = out(&o);
+            assert!(t.contains("poll_interval_secs") && t.contains("u64"), "{t}");
+        }
     }
 }
 
@@ -556,6 +604,9 @@ fn duplicate_sources_are_refused_from_flags_and_the_environment() {
         "a=http://127.0.0.1:3002/x,b=http://127.0.0.1:3002/y",
         "a=http://LOCALHOST:3002,b=http://localhost:3002",
         &format!("a={MEMPOOL_ONION}/signet/api,b={MEMPOOL_ONION}/signet/api"),
+        "a=http://localhost:3002/api,b=http://127.0.0.1:3002/api",
+        "a=http://127.0.0.2:3002/api,b=http://127.0.0.1:3002/api",
+        "a=http://[::1]:3002/api,b=http://localhost:3002/api",
     ] {
         let o = base_env(&mut bin())
             .args(["check-config", "--sources", list])
@@ -568,6 +619,27 @@ fn duplicate_sources_are_refused_from_flags_and_the_environment() {
             out(&o)
         );
     }
+    // The same through the environment variable.
+    let o = base_env(&mut bin())
+        .arg("check-config")
+        .env(
+            "TRUST_ISSUES_SOURCES",
+            "a=http://localhost:3002/api,b=http://127.0.0.1:3002/api",
+        )
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("same host and port"), "{}", out(&o));
+    // 0.0.0.0 is not a machine you can ask.
+    let o = base_env(&mut bin())
+        .arg("check-config")
+        .env(
+            "TRUST_ISSUES_SOURCES",
+            "a=http://0.0.0.0:3002/api,b=http://127.0.0.1:3003/api",
+        )
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
     // A different port on one machine is a different explorer.
     let o = base_env(&mut bin())
         .arg("check-config")
@@ -600,4 +672,62 @@ fn a_password_in_the_environment_is_ignored_loudly_and_never_echoed() {
         !s.contains("pw-sentinel") && !s.contains("user-sentinel"),
         "{s}"
     );
+}
+
+#[test]
+fn a_url_that_cannot_be_shown_safely_is_never_echoed() {
+    for u in [
+        "http:/reader:sentinel@localhost",
+        "reader:sentinel@host",
+        "http://reader:sentinel@",
+        "http://reader%3Asentinel%40x@host/",
+    ] {
+        let o = base_env(&mut bin())
+            .arg("check-config")
+            .env(
+                "TRUST_ISSUES_SOURCES",
+                format!("a={u},b=http://127.0.0.1:3003"),
+            )
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{u}: {}", out(&o));
+        assert!(!out(&o).contains("sentinel"), "{u}: {}", out(&o));
+        let f = file(
+            "unsafe_url",
+            &format!(
+                "network = \"signet\"\ntor_socks = \"127.0.0.1:9050\"\n[[sources]]\nname = \"a\"\nurl = \"{u}\"\n[[sources]]\nname = \"b\"\nurl = \"http://127.0.0.1:3003\"\n"
+            ),
+        );
+        let o = bin()
+            .args(["check-config", "--config"])
+            .arg(&f)
+            .output()
+            .unwrap();
+        assert!(!o.status.success(), "{u}: {}", out(&o));
+        assert!(!out(&o).contains("sentinel"), "{u}: {}", out(&o));
+    }
+}
+
+#[test]
+fn a_tor_address_with_a_login_is_refused_and_never_printed() {
+    let o = bin()
+        .arg("check-config")
+        .env("TRUST_ISSUES_NETWORK", "signet")
+        .env("TRUST_ISSUES_TOR_SOCKS", "reader:sentinel@tor:9050")
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(!out(&o).contains("sentinel"), "{}", out(&o));
+    let f = file(
+        "tor_login",
+        "network = \"signet\"\ntor_socks = \"reader:sentinel@tor:9050\"\n",
+    );
+    let o = bin()
+        .args(["check-config", "--config"])
+        .arg(&f)
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("tor_socks"), "{}", out(&o));
+    assert!(!out(&o).contains("sentinel"), "{}", out(&o));
 }

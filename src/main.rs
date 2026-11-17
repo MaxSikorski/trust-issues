@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing::{info, warn};
 use trust_issues::config::{Config, Overrides, Route, load_config};
 use trust_issues::esplora::EsploraSource;
@@ -27,15 +27,6 @@ use trust_issues::systemd;
     about = "A stand-in bitcoind that reads the chain from block explorers over Tor"
 )]
 struct Cli {
-    /// Optional config file (TOML)
-    #[arg(
-        long,
-        global = true,
-        env = "TRUST_ISSUES_CONFIG",
-        hide_env_values = true,
-        allow_hyphen_values = true
-    )]
-    config: Option<PathBuf>,
     /// signet (or regtest for tests)
     #[arg(
         long,
@@ -121,18 +112,56 @@ enum Command {
     CheckConfig,
 }
 
-fn load(cli: &Cli) -> Result<Config> {
-    // clap keeps only the last of a repeated global flag, so count them here.
-    let given = std::env::args_os()
-        .skip(1)
-        .filter(|a| a == "--config" || a.to_string_lossy().starts_with("--config="))
-        .count();
-    if given > 1 {
+/// The `--config` flag, added to the program and to each subcommand so that
+/// clap keeps what was typed in each place instead of letting the last win.
+fn config_arg() -> clap::Arg {
+    clap::Arg::new("config")
+        .long("config")
+        .value_name("CONFIG")
+        .help("Optional config file (TOML)")
+        .env("TRUST_ISSUES_CONFIG")
+        .hide_env_values(true)
+        .allow_hyphen_values(true)
+        .action(clap::ArgAction::Append)
+        .value_parser(clap::value_parser!(PathBuf))
+}
+
+fn command() -> clap::Command {
+    Cli::command()
+        .arg(config_arg())
+        .mut_subcommand("check-config", |s| s.arg(config_arg()))
+        .mut_subcommand("health-check", |s| s.arg(config_arg()))
+}
+
+/// The config file named on the command line, else in the environment.
+/// Refuses two `--config` flags. Only the places clap parsed as the flag count,
+/// so a file that is itself named `--config` is just a value.
+fn config_path(m: &ArgMatches) -> Result<Option<PathBuf>> {
+    let from_flag = |m: &ArgMatches| -> Vec<PathBuf> {
+        if m.value_source("config") == Some(clap::parser::ValueSource::CommandLine) {
+            m.get_many::<PathBuf>("config")
+                .map(|v| v.cloned().collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut flags = from_flag(m);
+    if let Some((_, sub)) = m.subcommand() {
+        flags.extend(from_flag(sub));
+    }
+    if flags.len() > 1 {
         bail!("--config was given more than once; pass one config file");
     }
-    let text = match &cli.config {
+    Ok(flags
+        .pop()
+        .or_else(|| m.get_one::<PathBuf>("config").cloned()))
+}
+
+fn load(cli: &Cli, matches: &ArgMatches) -> Result<Config> {
+    let text = match config_path(matches)? {
         Some(p) => {
-            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+            Some(std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?)
         }
         None => None,
     };
@@ -316,11 +345,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let matches = command().get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
     if !matches!(cli.command, Some(Command::HealthCheck { .. })) {
         warn_ignored_credentials();
     }
-    let cfg = match load(&cli) {
+    let cfg = match load(&cli, &matches) {
         Ok(c) => c,
         Err(e) if matches!(cli.command, Some(Command::CheckConfig)) => {
             eprintln!("{e:#}");
@@ -432,12 +462,22 @@ async fn main() -> Result<()> {
 mod tests {
     use super::write_cookie;
 
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trust-issues-cookie-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp() {
-        let dir =
-            std::env::temp_dir().join(format!("trust-issues-cookie-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("stale");
         // A leftover from a crash, readable by everyone.
         std::fs::write(dir.join(".cookie.tmp"), "stale").unwrap();
         let path = write_cookie(&dir, "abc123").unwrap();
@@ -452,5 +492,29 @@ mod tests {
         // Written again on the next start: a fresh password, still private.
         let path = write_cookie(&dir, "def456").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:def456");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The old code wrote through whatever sat at `.cookie.tmp`. A planted
+    /// symlink must be replaced, and the file it points at left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_at_the_tmp_name_is_never_written_through() {
+        let dir = scratch("symlink");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "precious").unwrap();
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&outside, data.join(".cookie.tmp")).unwrap();
+        let path = write_cookie(&data, "abc123").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "__cookie__:abc123");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -135,7 +135,7 @@ pub fn parse_network(s: &str) -> Result<Network, ConfigError> {
 
 /// Decide how a source may be reached, or refuse it.
 pub fn route_for(url: &str, tor_socks: Option<&str>) -> Result<Route, ConfigError> {
-    let shown = redact(url);
+    let shown = shown(url);
     let parsed = reqwest::Url::parse(url).map_err(|_| ConfigError::BadUrl(shown.clone()))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ConfigError::UrlHasLogin(shown));
@@ -167,28 +167,42 @@ pub fn route_for(url: &str, tor_socks: Option<&str>) -> Result<Route, ConfigErro
     }
 }
 
-/// The text with any `user:password@` after `://` replaced, so error messages
-/// and logs never carry a login.
-fn redact(s: &str) -> String {
-    let Some(start) = s.find("://").map(|i| i + 3) else {
-        return s.to_string();
-    };
-    let end = s[start..]
-        .find(['/', '?', '#'])
-        .map_or(s.len(), |i| start + i);
-    match s[start..end].rfind('@') {
-        Some(at) => format!("{}***@{}", &s[..start], &s[start + at + 1..]),
-        None => s.to_string(),
+/// The URL as text for an error message, or a placeholder. A URL is echoed
+/// only when it parses, has no login and holds no `@` anywhere: anything else
+/// might carry a password in a shape nobody thought of.
+fn shown(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) if u.username().is_empty() && u.password().is_none() && !url.contains('@') => {
+            url.to_string()
+        }
+        _ => "(not shown: it may hold a login)".to_string(),
     }
 }
 
 /// Host (lowercase) and port of a source URL, defaults filled in.
 fn host_port(url: &str) -> Option<(String, u16)> {
     let u = reqwest::Url::parse(url).ok()?;
-    Some((
-        u.host_str()?.to_ascii_lowercase(),
-        u.port_or_known_default()?,
-    ))
+    let host = u
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    // Every spelling of "this machine" is one machine: localhost, 127.0.0.0/8,
+    // ::1 and the IPv4-mapped form.
+    let loopback = host == "localhost"
+        || match host.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => ip.is_loopback(),
+            Ok(IpAddr::V6(ip)) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+            Err(_) => false,
+        };
+    let host = if loopback {
+        "loopback".to_string()
+    } else {
+        host
+    };
+    Some((host, u.port_or_known_default()?))
 }
 
 pub fn parse_checkpoint(s: &str) -> Result<(u32, BlockHash), ConfigError> {
@@ -240,18 +254,19 @@ fn parse_sources_list(s: &str) -> Result<Vec<(String, String)>, ConfigError> {
     if s.trim().is_empty() {
         return Err(blank("sources"));
     }
-    let bad = |entry: &str| {
+    // The entry itself is never echoed: it may be a URL with a login.
+    let bad = |n: usize| {
         ConfigError::BadValue(format!(
-            "sources entry {:?} must look like name=url (no empty entries)",
-            redact(entry)
+            "sources entry number {n} must look like name=url (no empty entries)"
         ))
     };
     s.split(',')
-        .map(|entry| {
-            let (name, url) = entry.split_once('=').ok_or_else(|| bad(entry))?;
+        .enumerate()
+        .map(|(i, entry)| {
+            let (name, url) = entry.split_once('=').ok_or_else(|| bad(i + 1))?;
             let (name, url) = (name.trim(), url.trim());
             if name.is_empty() || url.is_empty() {
-                return Err(bad(entry));
+                return Err(bad(i + 1));
             }
             no_whitespace(name, url)?;
             Ok((name.to_string(), url.to_string()))
@@ -289,10 +304,20 @@ fn text_setting(
 
 /// `host:port`, with a non-empty host without whitespace and a port 1-65535.
 fn check_socks_address(s: &str) -> Result<(), ConfigError> {
+    // Letters, digits, dots, dashes and underscores, or a bracketed IPv6
+    // address: so no login (`user:pw@`) and no scheme can ride along.
+    let plain_host = |h: &str| {
+        !h.is_empty()
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    };
+    let ipv6 = |h: &str| {
+        h.strip_prefix('[')
+            .and_then(|x| x.strip_suffix(']'))
+            .is_some_and(|x| x.parse::<std::net::Ipv6Addr>().is_ok())
+    };
     let ok = s.rsplit_once(':').is_some_and(|(host, port)| {
-        !host.is_empty()
-            && !host.contains(char::is_whitespace)
-            && port.parse::<u16>().is_ok_and(|p| p >= 1)
+        (plain_host(host) || ipv6(host)) && port.parse::<u16>().is_ok_and(|p| p >= 1)
     });
     if ok {
         Ok(())
@@ -307,6 +332,57 @@ fn number_error(setting: &str) -> ConfigError {
     ConfigError::BadValue(format!("{setting} is not a valid number"))
 }
 
+/// Where a config file went wrong, in words that can't carry a value: the
+/// position, and for a wrong type the key (only if it is one of ours) and the
+/// expected type (only if it looks like a type name).
+fn parse_note(e: &toml::de::Error, text: &str) -> String {
+    let Some(span) = e.span() else {
+        return "wrong type or syntax".to_string();
+    };
+    let at = span.start.min(text.len());
+    let before = text.get(..at).unwrap_or("");
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    let mut note = format!("line {line}, column {col}: wrong type or syntax");
+    const KEYS: [&str; 12] = [
+        "network",
+        "rpc_bind",
+        "rpc_user",
+        "rpc_password",
+        "data_dir",
+        "tor_socks",
+        "poll_interval_secs",
+        "checkpoint",
+        "fee_ceiling_sat_vb",
+        "requests_per_sec",
+        "name",
+        "url",
+    ];
+    let key = text
+        .lines()
+        .nth(line - 1)
+        .and_then(|l| l.split_once('='))
+        .map(|(k, _)| k.trim())
+        .filter(|k| KEYS.contains(k));
+    // "invalid type: <what was found>, expected <type>": the part after the
+    // last ", expected " is the type (what was found comes before it).
+    let expected = e
+        .message()
+        .strip_prefix("invalid type: ")
+        .and_then(|m| m.rsplit_once(", expected "))
+        .map(|(_, t)| t.trim())
+        .filter(|t| {
+            !t.is_empty()
+                && t.len() <= 40
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '_' | '-'))
+        });
+    if let (Some(k), Some(t)) = (key, expected) {
+        note.push_str(&format!(" ({k} should be: {t})"));
+    }
+    note
+}
+
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
     load_config(Some(text), &Overrides::default())
 }
@@ -317,17 +393,8 @@ pub fn load_config(file_text: Option<&str>, o: &Overrides) -> Result<Config, Con
     let text = file_text.unwrap_or("");
     // Never the toml message: it can quote the line, and the line may hold a
     // password (or the file may be the cookie by mistake).
-    let file: FileConfig = toml::from_str(text).map_err(|e| {
-        ConfigError::Parse(match e.span() {
-            Some(span) => {
-                let before = &text[..span.start.min(text.len())];
-                let line = before.matches('\n').count() + 1;
-                let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
-                format!("syntax error at line {line}, column {col}")
-            }
-            None => "syntax error".to_string(),
-        })
-    })?;
+    let file: FileConfig =
+        toml::from_str(text).map_err(|e| ConfigError::Parse(parse_note(&e, text)))?;
     let network_name = text_setting("network", o.network.as_deref(), file.network.as_deref())?
         .ok_or_else(|| {
             ConfigError::BadValue("network must be set: signet (or regtest for tests)".into())
@@ -419,7 +486,16 @@ pub fn load_config(file_text: Option<&str>, o: &Overrides) -> Result<Config, Con
     };
     let mut sources: Vec<SourceSpec> = Vec::new();
     for (name, url) in raw_sources {
-        let route = route_for(&url, tor_socks)?;
+        let route = route_for(&url, tor_socks).map_err(|e| match e {
+            // Say which source it was, since the URL itself isn't shown.
+            ConfigError::UrlHasLogin(_) => ConfigError::BadValue(format!(
+                "source {name:?} has a user name or password in the URL; explorers don't need one, and it would end up in logs"
+            )),
+            ConfigError::BadUrl(u) if u.starts_with("(not shown") => ConfigError::BadValue(format!(
+                "source {name:?} has a URL that doesn't parse (not shown here, it may hold a login); use plain http://host:port/path"
+            )),
+            other => other,
+        })?;
         // One explorer listed twice would get two request budgets and count as
         // two opinions, so the same machine can only be a source once.
         let key = host_port(&url);

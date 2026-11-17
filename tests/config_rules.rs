@@ -124,6 +124,11 @@ fn two_sources_on_one_host_and_port_are_one_source_in_the_file_too() {
         ("http://127.0.0.1:3002/x", "http://127.0.0.1:3002/y"),
         ("http://LocalHost:3002", "http://localhost:3002"),
         ("http://127.0.0.1", "http://127.0.0.1:80"),
+        ("http://localhost:3002/api", "http://127.0.0.1:3002/api"),
+        ("http://127.0.0.2:3002/api", "http://127.0.0.1:3002/api"),
+        ("http://[::1]:3002/api", "http://127.0.0.1:3002/api"),
+        ("http://[::1]:3002/api", "http://localhost:3002/api"),
+        ("http://127.1.2.3:3002/api", "http://127.0.0.1:3002/api"),
     ] {
         let err = parse_config(&two_local_sources(a, b)).unwrap_err();
         assert!(
@@ -139,6 +144,34 @@ fn two_sources_on_one_host_and_port_are_one_source_in_the_file_too() {
     };
     let err = load_config(Some("network = \"regtest\"\n"), &o).unwrap_err();
     assert!(err.to_string().contains("same host and port"), "{err}");
+    // The same, spelled as a list (flag or environment variable).
+    for list in [
+        "a=http://localhost:3002/api,b=http://127.0.0.1:3002/api",
+        "a=http://127.0.0.2:3002/api,b=http://127.0.0.1:3002/api",
+        "a=http://[::1]:3002/api,b=http://127.0.0.1:3002/api",
+    ] {
+        let o = Overrides {
+            sources: Some(list.into()),
+            ..Overrides::default()
+        };
+        let err = load_config(Some("network = \"regtest\"\n"), &o).unwrap_err();
+        assert!(
+            err.to_string().contains("same host and port"),
+            "{list}: {err}"
+        );
+    }
+    // Different ports on loopback are different explorers.
+    let ok = two_local_sources("http://localhost:3002", "http://[::1]:3003");
+    assert_eq!(parse_config(&ok).unwrap().sources.len(), 2);
+}
+
+#[test]
+fn the_unspecified_address_is_never_a_source() {
+    for u in ["http://0.0.0.0:3002/api", "http://[::]:3002/api"] {
+        assert!(route_for(u, None).is_err(), "{u}");
+        let err = parse_config(&two_local_sources(u, "http://127.0.0.1:3003")).unwrap_err();
+        assert!(err.to_string().contains("neither"), "{u}: {err}");
+    }
 }
 
 #[test]
@@ -151,9 +184,92 @@ fn syntax_errors_report_only_the_position() {
         let msg = parse_config(text).unwrap_err().to_string();
         assert!(!msg.contains("sentinel"), "{msg}");
         assert!(
-            msg.starts_with("config file: syntax error at line "),
+            msg.starts_with("config file: line ") && msg.contains(", column "),
             "{msg}"
         );
+        assert!(msg.contains("wrong type or syntax"), "{msg}");
+    }
+    // A wrong type names the key and the expected type, never the value.
+    let msg = parse_config("network = \"signet\"\npoll_interval_secs = \"sentinel\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(msg.contains("poll_interval_secs"), "{msg}");
+    assert!(msg.contains("u64"), "{msg}");
+    assert!(msg.contains("line 2"), "{msg}");
+    // Even a value that imitates the message never gets through.
+    let msg = parse_config(
+        "network = \"signet\"\npoll_interval_secs = \"sentinel, expected sentinel\"\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(!msg.contains("sentinel"), "{msg}");
+}
+
+#[test]
+fn urls_that_cannot_be_shown_safely_are_not_shown() {
+    for u in [
+        "http:/reader:sentinel@localhost",
+        "reader:sentinel@host",
+        "http://reader:sentinel@",
+        "http://reader%3Asentinel%40x@host/",
+        "http://reader:sentinel%40localhost",
+        "http:reader:sentinel@localhost",
+        "http://u:sentinel@[::1",
+    ] {
+        let err = route_for(u, None).unwrap_err().to_string();
+        assert!(!err.contains("sentinel"), "{u}: {err}");
+        let o = Overrides {
+            sources: Some(format!("a={u},b=http://127.0.0.1:3003")),
+            ..Overrides::default()
+        };
+        let err = load_config(Some("network = \"regtest\"\n"), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sentinel"), "{u}: {err}");
+        assert!(err.contains("\"a\""), "names the source: {u}: {err}");
+        let err = parse_config(&two_local_sources(u, "http://127.0.0.1:3003"))
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sentinel"), "{u}: {err}");
+    }
+    // A list entry with no `=` that is really a URL with a login.
+    let o = Overrides {
+        sources: Some("http://reader:sentinel@host,b=http://127.0.0.1:3003".into()),
+        ..Overrides::default()
+    };
+    let err = load_config(Some("network = \"regtest\"\n"), &o).unwrap_err();
+    assert!(!err.to_string().contains("sentinel"), "{err}");
+}
+
+#[test]
+fn tor_socks_must_be_host_and_port_with_no_login() {
+    for bad in [
+        "reader:sentinel@tor:9050",
+        "sentinel@tor:9050",
+        "reader:sentinel:9050",
+        "socks5://tor:9050",
+    ] {
+        let text = format!("network = \"signet\"\ntor_socks = \"{bad}\"\n");
+        let err = parse_config(&text).unwrap_err().to_string();
+        assert!(err.contains("tor_socks"), "{bad}: {err}");
+        assert!(!err.contains("sentinel"), "{bad}: {err}");
+        let o = Overrides {
+            tor_socks: Some(bad.into()),
+            ..Overrides::default()
+        };
+        let err = load_config(Some("network = \"signet\"\n"), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("sentinel"), "{bad}: {err}");
+    }
+    for good in [
+        "127.0.0.1:9050",
+        "tor:9050",
+        "[::1]:9050",
+        "my-tor_1.lan:9050",
+    ] {
+        let text = format!("network = \"signet\"\ntor_socks = \"{good}\"\n");
+        assert!(parse_config(&text).is_ok(), "{good}");
     }
 }
 

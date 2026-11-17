@@ -10,22 +10,32 @@
 //!   until it meets the real target again. So it has valid proof of work
 //!   but no valid signature: what another signet, or a liar with a little
 //!   hash power, could serve. `the_forged_fixture_is_the_real_block_with_one_bit_flipped`
-//!   proves it is exactly that.
+//!   proves it is exactly that;
+//! - `signet-331314-nop.hex`: block 331314 with `OP_NOP` put in front of
+//!   its solution's scriptSig, the merkle root recomputed and the nonce
+//!   ground again. Bitcoin Core accepts that solution (the scriptSig needn't
+//!   be push-only), but our checker doesn't model it;
+//!   `the_nop_fixture_is_the_real_block_with_one_opcode_added` proves what
+//!   it is;
+//! - `signet-331279-header.hex` and `signet-331280-block.hex` to
+//!   `signet-331282-block.hex`: a checkpoint and the three small blocks
+//!   after it, for following more than one new block.
 
 mod common;
 
 use std::sync::Arc;
 
 use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::hashes::Hash;
 use bitcoin::hex::FromHex;
 use bitcoin::{Block, BlockHash, Network, ScriptBuf, TxOut, Witness};
 use common::*;
-use trust_issues::node::{ManualClock, Node, Settings};
-use trust_issues::proof::{ProofError, verify_block_for};
+use trust_issues::node::{AlarmLevel, ManualClock, Node, Settings};
+use trust_issues::proof::{ProofError, verify_block, verify_block_for};
 use trust_issues::signet::{
-    SIGNET_HEADER, STANDARD_SIGNET_CHALLENGE, SignetError, check_block_solution,
+    SIGNET_HEADER, STANDARD_SIGNET_CHALLENGE, SignetError, check_block_solution, find_solution,
 };
-use trust_issues::source::Source;
+use trust_issues::source::{Source, SourceError};
 
 fn block(hex: &str) -> Block {
     deserialize(&Vec::<u8>::from_hex(hex.trim()).unwrap()).unwrap()
@@ -110,6 +120,19 @@ fn real_signet_blocks_carry_valid_signatures() {
         assert_eq!(check(&b), Ok(()));
         let raw = serialize(&b);
         assert!(verify_block_for(Network::Signet, &raw, b.block_hash()).is_ok());
+        // The negative counterpart, so a checker that accepts everything
+        // can't pass: the same block with its signature's last DER byte
+        // changed fails.
+        let sig = real_signature(&b);
+        let mut broken = sig.clone();
+        let last_der = broken.len() - 2;
+        broken[last_der] ^= 0x01;
+        let mut ss = vec![0x00, broken.len() as u8];
+        ss.extend(&broken);
+        assert_eq!(
+            check(&with_script_sig(&b, &ss)),
+            Err(SignetError::BadSignature)
+        );
     }
     // The genesis block needs no signature, as in Bitcoin Core.
     assert_eq!(
@@ -177,6 +200,23 @@ fn a_missing_or_moved_solution_fails() {
         .insert(0, b.txdata[0].output[i].clone());
     assert_eq!(check(&early), Err(SignetError::BadSignature));
 
+    // Those fail for the right reason: moving the solution also changes the
+    // signed coinbase, so the signature would fail anyway. What matters is
+    // that the checker never even finds a solution there...
+    let real = find_solution(&b).unwrap().expect("the real solution");
+    assert_eq!(find_solution(&missing), Ok(None));
+    assert_eq!(find_solution(&moved), Ok(None));
+    assert_eq!(find_solution(&early), Ok(None));
+    // ...while it does find the real one in the last commitment, even with
+    // a solution-less commitment-looking output before it.
+    let mut late = b.clone();
+    late.txdata[0]
+        .output
+        .insert(0, missing.txdata[0].output[i].clone());
+    assert_eq!(find_solution(&late), Ok(Some(real.clone())));
+    assert_eq!(real.0.as_bytes()[0], 0x00, "OP_0 then the signature");
+    assert!(real.1.is_empty());
+
     // The header alone, with nothing after it, isn't a solution.
     let mut bare = b.clone();
     bare.txdata[0].output[i].script_pubkey = commitment_with(&b, Some(&[]));
@@ -225,6 +265,24 @@ fn the_solution_is_judged_like_bitcoin_cores_interpreter() {
     let mut extra_below = vec![0x51, 0x00];
     extra_below.extend(push(&sig));
     assert_eq!(check(&with_script_sig(&b, &extra_below)), Ok(()));
+    // Negative counterparts of those three (a checker that accepts every
+    // well-formed solution would pass the lines above): the same forms
+    // with one bit of the signature's S value flipped all fail.
+    let mut flipped = sig.clone();
+    let at = flipped.len() - 2;
+    flipped[at] ^= 0x01;
+    for form in [ok.clone(), pushdata1.clone(), extra_below.clone()] {
+        let pos = form
+            .windows(sig.len())
+            .position(|w| w == sig.as_slice())
+            .unwrap();
+        let mut f = form.clone();
+        f[pos..pos + sig.len()].copy_from_slice(&flipped);
+        assert_eq!(
+            check(&with_script_sig(&b, &f)),
+            Err(SignetError::BadSignature)
+        );
+    }
 
     // NULLDUMMY: the dummy must be empty.
     let mut dummy = vec![0x51];
@@ -305,6 +363,22 @@ fn the_forged_fixture_is_the_real_block_with_one_bit_flipped() {
     assert_eq!(a.len(), b.len());
     let diff: u32 = a.iter().zip(&b).map(|(x, y)| (x ^ y).count_ones()).sum();
     assert_eq!(diff, 1);
+    // And that bit is inside the signature's DER bytes (not its length,
+    // its sighash byte or anything else in the coinbase).
+    let at = a.iter().zip(&b).position(|(x, y)| x != y).unwrap();
+    let sig = real_signature(&real);
+    let der = &sig[..sig.len() - 1];
+    let der_at = a.windows(der.len()).position(|w| w == der).unwrap();
+    assert_eq!(
+        a.windows(der.len()).filter(|w| *w == der).count(),
+        1,
+        "the signature appears once"
+    );
+    assert!(
+        (der_at + 2..der_at + der.len()).contains(&at),
+        "byte {at} isn't inside the signature's DER body at {der_at}..{}",
+        der_at + der.len()
+    );
     assert_eq!(real.txdata[1..], forged.txdata[1..]);
     // A header that honestly commits to that and meets the real target.
     assert!(forged.check_merkle_root() && forged.check_witness_commitment());
@@ -403,4 +477,384 @@ async fn regtest_blocks_need_no_signature() {
     assert_eq!(node.with_chain(|c| c.tip_height()), 3);
     assert!(alarm_codes(&node).is_empty(), "{:?}", alarm_codes(&node));
     assert!(node.get_block(blocks[3].block_hash()).await.is_ok());
+}
+
+// ---------- review findings (2026-11-17) ----------
+
+fn hex_block(hex: &str) -> Block {
+    block(hex)
+}
+
+fn header_279() -> bitcoin::block::Header {
+    deserialize(
+        &Vec::<u8>::from_hex(include_str!("fixtures/signet-331279-header.hex").trim()).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A fake explorer on signet serving `checkpoint` and then `next` (by
+/// position; see [`signet_source`]).
+fn signet_source_on(
+    name: &str,
+    checkpoint: bitcoin::block::Header,
+    next: &[Block],
+) -> Arc<FakeSource> {
+    let mut blocks = vec![Block {
+        header: checkpoint,
+        txdata: Vec::new(),
+    }];
+    blocks.extend(next.iter().cloned());
+    let s = FakeSource::honest(name, &blocks);
+    s.with(|st| {
+        st.genesis_override = Some(bitcoin::constants::genesis_block(Network::Signet).block_hash())
+    });
+    s
+}
+
+fn signet_node(sources: &[Arc<FakeSource>], checkpoint: (u32, BlockHash), now: u32) -> Node {
+    let dyns: Vec<Arc<dyn Source>> = sources
+        .iter()
+        .map(|s| s.clone() as Arc<dyn Source>)
+        .collect();
+    Node::new(
+        signet_settings(checkpoint),
+        dyns,
+        Arc::new(ManualClock::new(u64::from(now) + 60)),
+    )
+}
+
+/// Block 331314 with every witness taken out (the coinbase's reserved
+/// value too). Same txids, so the same header and signet signature.
+fn stripped_314() -> Block {
+    let mut b = block_314();
+    for tx in &mut b.txdata {
+        for input in &mut tx.input {
+            input.witness = Witness::new();
+        }
+    }
+    b
+}
+
+/// Block 331314 with its last transaction listed twice: the merkle tree
+/// pads an odd level by repeating the last node, so the root is the same
+/// (CVE-2012-2459).
+fn padded_314() -> Block {
+    let mut b = block_314();
+    let last = b.txdata.last().unwrap().clone();
+    b.txdata.push(last);
+    b
+}
+
+#[test]
+fn malleated_copies_of_a_real_block_are_refused() {
+    let real = block_314();
+    for (bad, why) in [
+        (stripped_314(), ProofError::BadWitnessCommitment),
+        (padded_314(), ProofError::DuplicateTransactions),
+    ] {
+        // The malleation keeps the header and the signature...
+        assert_eq!(bad.block_hash(), real.block_hash());
+        assert_eq!(check(&bad), Ok(()));
+        assert!(bad.check_merkle_root());
+        assert_ne!(serialize(&bad), serialize(&real));
+        // ...but the body isn't the block.
+        let raw = serialize(&bad);
+        assert_eq!(
+            verify_block_for(Network::Signet, &raw, real.block_hash()).unwrap_err(),
+            why
+        );
+        assert!(!why.to_string().is_empty() && why.proves_a_lie());
+    }
+    // Bitcoin Core's other witness rules (`CheckWitnessMalleation`):
+    let reserved = real.txdata[0].input[0].witness.clone();
+    assert_eq!((reserved.len(), reserved.nth(0).unwrap().len()), (1, 32));
+    let refused = |b: &Block| verify_block(&serialize(b), b.block_hash()).unwrap_err();
+    // the commitment's reserved value is missing (other witnesses kept)...
+    let mut no_reserved = real.clone();
+    no_reserved.txdata[0].input[0].witness = Witness::new();
+    assert_eq!(refused(&no_reserved), ProofError::BadWitnessCommitment);
+    // ...or isn't 32 bytes...
+    let mut short = real.clone();
+    short.txdata[0].input[0].witness = Witness::from_slice(&[[0u8; 31]]);
+    assert_eq!(refused(&short), ProofError::BadWitnessCommitment);
+    // ...or a witness was changed...
+    let mut changed = real.clone();
+    let tx = changed
+        .txdata
+        .iter_mut()
+        .skip(1)
+        .find(|t| !t.input[0].witness.is_empty());
+    let tx = tx.expect("a segwit spend in 331314");
+    let mut items: Vec<Vec<u8>> = tx.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    items[0][5] ^= 0x01;
+    tx.input[0].witness = Witness::from_slice(&items);
+    assert_eq!(refused(&changed), ProofError::BadWitnessCommitment);
+    // ...or there's witness data with no commitment at all (a new header,
+    // since dropping the commitment output changes the coinbase).
+    let (i, _) = solution_at(&real);
+    let mut no_commitment = real.clone();
+    no_commitment.txdata[0].output.remove(i);
+    no_commitment.header.merkle_root = no_commitment.compute_merkle_root().unwrap();
+    assert_eq!(refused(&no_commitment), ProofError::BadWitnessCommitment);
+    // Counterparts that pass: no commitment and no witness data at all, and
+    // the real block itself.
+    for tx in &mut no_commitment.txdata {
+        for input in &mut tx.input {
+            input.witness = Witness::new();
+        }
+    }
+    no_commitment.header.merkle_root = no_commitment.compute_merkle_root().unwrap();
+    let raw = serialize(&no_commitment);
+    assert!(verify_block(&raw, no_commitment.block_hash()).is_ok());
+    assert!(verify_block(&serialize(&real), real.block_hash()).is_ok());
+}
+
+#[tokio::test]
+async fn a_malleated_body_never_reaches_the_cache_and_the_honest_copy_is_served() {
+    let real = block_314();
+    for bad in [stripped_314(), padded_314()] {
+        let liar = signet_source("liar", &bad);
+        let honest = signet_source("honest", &real);
+        let node = signet_node(
+            &[liar.clone(), honest.clone()],
+            (331_313, header_313().block_hash()),
+            real.header.time,
+        );
+        node.start().await.expect("start");
+        node.tick().await;
+        assert_eq!(node.with_chain(|c| c.tip_hash()), real.block_hash());
+        let raw = node.get_block(real.block_hash()).await.expect("block");
+        assert_eq!(*raw, serialize(&real));
+        let alarms = node.alarms();
+        assert!(alarms.contains_key("source-bad:liar"), "{alarms:?}");
+        assert!(!alarms.contains_key("source-bad:honest"), "{alarms:?}");
+    }
+
+    // With only the malleator answering, nothing is followed or cached; an
+    // honest source that answers later is used and not blamed.
+    for bad in [stripped_314(), padded_314()] {
+        let liar = signet_source("liar", &bad);
+        let honest = signet_source("honest", &real);
+        let node = signet_node(
+            &[liar.clone(), honest.clone()],
+            (331_313, header_313().block_hash()),
+            real.header.time,
+        );
+        node.start().await.expect("start");
+        honest.with(|s| s.fail = Some(SourceError::NotFound));
+        node.tick().await;
+        assert_eq!(node.with_chain(|c| c.tip_height()), 331_313);
+        honest.with(|s| s.fail = None);
+        node.tick().await;
+        assert_eq!(node.with_chain(|c| c.tip_hash()), real.block_hash());
+        let raw = node.get_block(real.block_hash()).await.expect("block");
+        assert_eq!(*raw, serialize(&real));
+        // The honest copy was downloaded (nothing stale stood in for it).
+        assert_eq!(honest.with(|s| s.raw_block_calls), 1);
+        let alarms = node.alarms();
+        assert!(alarms.contains_key("source-bad:liar"), "{alarms:?}");
+        assert!(!alarms.contains_key("source-bad:honest"), "{alarms:?}");
+    }
+}
+
+fn nop_314() -> Block {
+    block(include_str!("fixtures/signet-331314-nop.hex"))
+}
+
+#[tokio::test]
+async fn a_solution_we_dont_model_is_refused_without_blaming_anyone() {
+    let nop = nop_314();
+    assert_eq!(check(&nop), Err(SignetError::UnsupportedSolution));
+    let a = signet_source("a", &nop);
+    let b = signet_source("b", &nop);
+    let node = signet_node(
+        &[a.clone(), b.clone()],
+        (331_313, header_313().block_hash()),
+        nop.header.time,
+    );
+    node.start().await.expect("start");
+    node.tick().await;
+    // Not followed (fail closed)...
+    assert_eq!(node.with_chain(|c| c.tip_height()), 331_313);
+    // ...but nobody is called a liar: Core may well accept this block.
+    let alarms = node.alarms();
+    assert!(
+        !alarms.keys().any(|k| k.starts_with("source-bad:")),
+        "{alarms:?}"
+    );
+    assert!(
+        alarms.values().all(|a| a.level == AlarmLevel::Warning),
+        "{alarms:?}"
+    );
+    assert!(
+        alarms.values().any(|a| a.message.contains("doesn't model")),
+        "{alarms:?}"
+    );
+    // The block isn't downloaded again every round.
+    let downloads = a.with(|s| s.raw_block_calls) + b.with(|s| s.raw_block_calls);
+    node.tick().await;
+    assert_eq!(
+        a.with(|s| s.raw_block_calls) + b.with(|s| s.raw_block_calls),
+        downloads
+    );
+    assert!(node.get_block(nop.block_hash()).await.is_err());
+
+    // The same through `getblock` for an old block below the checkpoint
+    // (the fakes answer height 1 with this block): refused, nobody blamed.
+    let a = signet_source("a", &nop);
+    let b = signet_source("b", &nop);
+    let node = signet_node(
+        &[a.clone(), b.clone()],
+        (331_313, header_313().block_hash()),
+        nop.header.time,
+    );
+    node.start().await.expect("start");
+    assert_eq!(node.deep_hash_at(1).await, Ok(nop.block_hash()));
+    let err = node.get_block(nop.block_hash()).await.unwrap_err();
+    assert!(err.message.contains("doesn't model"), "{err:?}");
+    let alarms = node.alarms();
+    assert!(
+        !alarms.keys().any(|k| k.starts_with("source-bad:")),
+        "{alarms:?}"
+    );
+    assert!(
+        alarms.values().any(|a| a.message.contains("doesn't model")),
+        "{alarms:?}"
+    );
+}
+
+#[test]
+fn the_nop_fixture_is_the_real_block_with_one_opcode_added() {
+    let real = block_314();
+    let nop = nop_314();
+    assert_eq!(real.txdata[1..], nop.txdata[1..]);
+    // The only change: OP_NOP (0x61) in front of the solution's scriptSig
+    // (so the scriptSig, the solution and the push each grow by a byte).
+    let (i, start) = solution_at(&real);
+    let r = real.txdata[0].output[i].script_pubkey.as_bytes();
+    let n = nop.txdata[0].output[i].script_pubkey.as_bytes();
+    assert_eq!(&n[..38], &r[..38]);
+    assert_eq!((r[38], n[38]), (0x4c, 0x4c));
+    assert_eq!(n[39], r[39] + 1);
+    assert_eq!(&n[40..start], &r[40..start]);
+    assert_eq!(n[start], r[start] + 1);
+    assert_eq!(n[start + 1], 0x61);
+    assert_eq!(&n[start + 2..], &r[start + 1..]);
+    let mut coinbase = nop.txdata[0].clone();
+    coinbase.output[i] = real.txdata[0].output[i].clone();
+    assert_eq!(coinbase, real.txdata[0]);
+    // A header that commits to it honestly and meets the real target.
+    assert!(nop.check_merkle_root() && nop.check_witness_commitment());
+    assert_eq!(
+        (nop.header.prev_blockhash, nop.header.time, nop.header.bits),
+        (
+            real.header.prev_blockhash,
+            real.header.time,
+            real.header.bits
+        )
+    );
+    assert!(nop.header.validate_pow(nop.header.target()).is_ok());
+}
+
+#[tokio::test]
+async fn bootstrap_refuses_a_checkpoint_from_another_signet() {
+    // Two explorers agree on a chain whose block 6 below their tip has
+    // valid proof of work but isn't signed for our signet.
+    let fillers = build_chain(6, 1);
+    let make = |name: &str, at1: &Block| {
+        let mut blocks = vec![
+            bitcoin::constants::genesis_block(Network::Signet),
+            at1.clone(),
+        ];
+        blocks.extend(fillers[1..].iter().cloned());
+        let s = FakeSource::honest(name, &blocks);
+        s.with(|st| {
+            st.genesis_override =
+                Some(bitcoin::constants::genesis_block(Network::Signet).block_hash())
+        });
+        s
+    };
+    let mut settings = signet_settings((0, BlockHash::all_zeros()));
+    settings.checkpoint = None;
+    let forged = forged_314();
+    let srcs = [make("a", &forged), make("b", &forged)];
+    let dyns: Vec<Arc<dyn Source>> = srcs.iter().map(|s| s.clone() as Arc<dyn Source>).collect();
+    let node = Node::new(
+        settings,
+        dyns,
+        Arc::new(ManualClock::new(u64::from(forged.header.time) + 60)),
+    );
+    assert_eq!(fillers.len() + 1, 8);
+    assert!(node.start().await.is_err());
+    assert!(!node.is_ready());
+
+    // The same with the real block: it bootstraps from it.
+    let real = block_314();
+    let srcs = [make("a", &real), make("b", &real)];
+    let dyns: Vec<Arc<dyn Source>> = srcs.iter().map(|s| s.clone() as Arc<dyn Source>).collect();
+    let mut settings = signet_settings((0, BlockHash::all_zeros()));
+    settings.checkpoint = None;
+    let node = Node::new(
+        settings,
+        dyns,
+        Arc::new(ManualClock::new(u64::from(real.header.time) + 60)),
+    );
+    node.start().await.expect("start");
+    assert_eq!(node.with_chain(|c| c.tip_hash()), real.block_hash());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_block_is_downloaded_once_however_many_sources_offer_it() {
+    let real = block_314();
+    let a = signet_source("a", &real);
+    let b = signet_source("b", &real);
+    for s in [&a, &b] {
+        s.with(|st| st.raw_block_delay = Some(std::time::Duration::from_secs(2)));
+    }
+    let node = signet_node(
+        &[a.clone(), b.clone()],
+        (331_313, header_313().block_hash()),
+        real.header.time,
+    );
+    node.start().await.expect("start");
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), real.block_hash());
+    assert_eq!(
+        a.with(|s| s.raw_block_calls) + b.with(|s| s.raw_block_calls),
+        1
+    );
+    assert!(!node.alarms().keys().any(|k| k.starts_with("source-bad:")));
+}
+
+#[tokio::test]
+async fn a_withheld_block_stops_the_run_there_without_blame() {
+    let blocks = [
+        hex_block(include_str!("fixtures/signet-331280-block.hex")),
+        hex_block(include_str!("fixtures/signet-331281-block.hex")),
+        hex_block(include_str!("fixtures/signet-331282-block.hex")),
+    ];
+    let s = signet_source_on("s", header_279(), &blocks);
+    s.with(|st| {
+        st.withheld_blocks.insert(blocks[2].block_hash());
+    });
+    let node = signet_node(
+        std::slice::from_ref(&s),
+        (331_279, header_279().block_hash()),
+        blocks[2].header.time,
+    );
+    node.start().await.expect("start");
+    node.tick().await;
+    // The two proven blocks are followed; the withheld one waits.
+    assert_eq!(node.with_chain(|c| c.tip_height()), 331_281);
+    assert_eq!(node.with_chain(|c| c.tip_hash()), blocks[1].block_hash());
+    assert!(
+        !node.alarms().keys().any(|k| k.starts_with("source-bad:")),
+        "{:?}",
+        node.alarms()
+    );
+    // Served at last: the tip moves on.
+    s.with(|st| st.withheld_blocks.clear());
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), blocks[2].block_hash());
+    assert!(node.alarms().keys().all(|k| !k.starts_with("source-bad:")));
 }

@@ -2,8 +2,9 @@
 //! withhold, rate-limit or drop broadcasts. Used by the demo and the tests.
 //! No network, no keys, no real coins.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::node::{ManualClock, Node, Settings};
 use crate::source::{FeeMap, MerkleProof, Outspend, Source, SourceError, TxStatus};
@@ -168,6 +169,13 @@ pub struct FakeState {
     pub received: Vec<String>,
     pub mempool: HashMap<Txid, Transaction>,
     pub calls: usize,
+    /// How many times `raw_block` was asked.
+    pub raw_block_calls: usize,
+    /// `raw_block` waits this long before answering (a slow download).
+    pub raw_block_delay: Option<Duration>,
+    /// `raw_block` answers "not found" for these (withholding a block
+    /// while showing its header).
+    pub withheld_blocks: HashSet<BlockHash>,
 }
 
 pub struct FakeSource {
@@ -275,7 +283,18 @@ impl Source for FakeSource {
     }
 
     async fn raw_block(&self, hash: BlockHash) -> Result<Vec<u8>, SourceError> {
+        let delay = {
+            let mut s = self.state.lock().unwrap();
+            s.raw_block_calls += 1;
+            s.raw_block_delay
+        };
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
+        if s.withheld_blocks.contains(&hash) {
+            return Err(SourceError::NotFound);
+        }
         let mut b = s
             .blocks
             .iter()

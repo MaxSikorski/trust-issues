@@ -22,7 +22,7 @@ Two examples are not tests:
 | watchdog_settings_are_read_like_systemd_means_them | `WATCHDOG_USEC` halved; `WATCHDOG_PID` must be ours; bad values mean no watchdog |
 | notify_sends_one_datagram_to_the_socket | One datagram to the socket; abstract `@` sockets refused |
 
-## chain_rules.rs: the header chain (11)
+## chain_rules.rs: the header chain (14)
 | Test | Checks |
 |---|---|
 | valid_chain_extends_from_checkpoint | A valid run of headers extends the chain; heights, confirmations, next block |
@@ -36,20 +36,30 @@ Two examples are not tests:
 | ignores_a_fork_with_less_work | A lower-work branch is kept aside, not followed |
 | rejects_header_not_later_than_the_median_of_the_last_eleven | A header's time must be later than the median of the 11 before it, inside one batch too |
 | the_median_time_rule_waits_for_eleven_known_headers_above_a_checkpoint | Skipped until 11 earlier headers are known (fewer could refuse an honest header); applies after |
+| at_a_retarget_the_bits_must_be_exactly_what_core_computes | With a 4-block test interval: at a retarget only Core's exact `bits` pass (one unit harder or easier, or unchanged, is refused); between retargets nothing may change |
+| an_honest_four_times_harder_retarget_survives_compact_rounding | A 4x-harder retarget that rounds just under a strict quarter is accepted, with the period known (exact rule) and from a checkpoint inside it (Core's permitted range); one unit harder is refused |
+| the_retarget_matches_real_signet_and_cores_rounding | Real signet block 330624 (0x1d14cd85 to 0x1d14fcee) computed exactly; 0x1d14fcee to 0x1d053f3b; time running backwards; the cap at signet's limit; Core's permitted range at 330624 |
 
-## signet_signatures.rs: signet block signatures, BIP325 (8)
-Real standard-signet blocks in `tests/fixtures/` (read once from a local node), plus block 331314 forged with one signature bit flipped and its proof of work ground again.
+## signet_signatures.rs: signet block signatures, BIP325 (15)
+Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 331301, 331314, 331280 to 331282, and two headers), plus two altered copies of block 331314 with their proof of work ground again: one with a signature bit flipped, one with `OP_NOP` in front of its solution.
 
 | Test | Checks |
 |---|---|
-| real_signet_blocks_carry_valid_signatures | Blocks 331314 and 331301 pass; genesis needs no signature |
+| real_signet_blocks_carry_valid_signatures | Blocks 331314 and 331301 pass, and fail with one signature bit changed; genesis needs no signature |
 | a_flipped_bit_in_the_signature_or_the_signed_header_fails | A flipped signature bit, a changed time or reordered transactions all fail |
-| a_missing_or_moved_solution_fails | No solution, one in another output or an earlier commitment, a bare header, leftover bytes, no commitment: all refused |
-| the_solution_is_judged_like_bitcoin_cores_interpreter | Equivalent scriptSigs pass; a non-empty dummy, missing dummy, loose DER, empty signature, other sighash byte or a witness fail; non-push opcodes are refused by name |
+| a_missing_or_moved_solution_fails | No solution, one in another output or an earlier commitment, a bare header, leftover bytes, no commitment: all refused; a moved solution isn't even found (`find_solution`), the real one is |
+| the_solution_is_judged_like_bitcoin_cores_interpreter | Equivalent scriptSigs pass, and fail with a signature bit flipped; a non-empty dummy, missing dummy, loose DER, empty signature, other sighash byte or a witness fail; non-push opcodes are refused by name |
 | only_the_standard_signet_challenge_is_accepted | Any other challenge (OP_TRUE, swapped keys) is refused, saying why |
-| the_forged_fixture_is_the_real_block_with_one_bit_flipped | The forged fixture differs by one bit, commits to it honestly and meets the real target |
+| the_forged_fixture_is_the_real_block_with_one_bit_flipped | The forged fixture differs by one bit, inside the signature's DER body, commits to it honestly and meets the real target |
 | a_valid_pow_header_without_a_valid_signature_marks_its_source_bad | Fake explorers on signet: the forger is marked bad, the real block is followed, `getblock` is served from the cache with no extra requests |
 | regtest_blocks_need_no_signature | Regtest skips the check and its chains run as before |
+| malleated_copies_of_a_real_block_are_refused | 331314 with its witnesses stripped or its last transaction repeated keeps its header and signature but is refused; so are a missing or short reserved value, a changed witness, and witness data with no commitment; the real block and a witness-free block without a commitment pass |
+| a_malleated_body_never_reaches_the_cache_and_the_honest_copy_is_served | Fake explorers: the malleator is marked bad, the real body is followed and served, and an honest explorer answering later isn't blamed |
+| a_solution_we_dont_model_is_refused_without_blaming_anyone | The `OP_NOP` block isn't followed or served (tip and `getblock` of an old block), nobody is marked bad, a warning says why, and it isn't downloaded again |
+| the_nop_fixture_is_the_real_block_with_one_opcode_added | The `OP_NOP` fixture differs from 331314 only by that opcode, commits to it honestly and meets the real target |
+| bootstrap_refuses_a_checkpoint_from_another_signet | Two explorers agreeing on a starting block that isn't signed for our signet: no start; with the real block it starts |
+| a_new_block_is_downloaded_once_however_many_sources_offer_it | Two explorers, a slow download: the block is fetched once |
+| a_withheld_block_stops_the_run_there_without_blame | Three new headers, the third block withheld: two are followed, nobody is blamed, the tip moves once it's served |
 
 ## proofs_fees_limits.rs: proofs, fees, politeness (8)
 | Test | Checks |
@@ -178,9 +188,16 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node), 
 | the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp | The RPC cookie is created at 0600 (never readable by others, even for a moment) and a leftover `.cookie.tmp` is replaced; cleans up after itself |
 | a_planted_symlink_at_the_tmp_name_is_never_written_through | A symlink planted at `.cookie.tmp` is replaced and the file it points at stays untouched |
 
-## src/esplora.rs: unit test (1)
+## src/esplora.rs: unit tests (2)
 | Test | Checks |
 |---|---|
 | retry_after_on_a_503_is_a_rate_limit | A 503 with `Retry-After` is a slow-down like a 429; a bare 503 stays a server error |
+| a_chunked_answer_is_cut_off_at_the_limit_while_streaming | A loopback HTTP server streams 64 MiB chunked with no length: refused as too large, and reading stops soon after 8 MiB |
 
-**Total: 131 tests.**
+## src/node.rs: unit tests (1, plus 1 in the browser build)
+| Test | Checks |
+|---|---|
+| with_the_signet_check_feature_signet_runs | With the checker built in, a signet node starts and signet's genesis passes |
+| without_the_signet_check_feature_signet_is_refused | Only in `cargo test --lib --no-default-features` (the browser build, as CI runs it): every signet block is refused, a signet node never starts and raises a critical alarm; regtest still works |
+
+**Total: 143 tests** (`cargo test --locked`), plus 1 in the browser build (`cargo test --locked --lib --no-default-features`).

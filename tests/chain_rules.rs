@@ -227,3 +227,159 @@ fn the_median_time_rule_waits_for_eleven_known_headers_above_a_checkpoint() {
     let err = chain.connect(&[old.header], now_after(&more)).unwrap_err();
     assert!(matches!(err, ChainError::TimeTooOld { .. }), "{err:?}");
 }
+
+// ---------- retargeting exactly like Bitcoin Core (review, 2026-11-17) ----------
+
+/// Signet's rules with a 4-block retarget interval and regtest's easy
+/// limit, so a test can mine its way to a retarget boundary.
+fn short_signet_params() -> bitcoin::params::Params {
+    let mut p = bitcoin::params::Params::new(Network::Signet);
+    p.pow_target_timespan = 4 * 600;
+    p.max_attainable_target =
+        bitcoin::Target::from_compact(CompactTarget::from_consensus(REGTEST_BITS));
+    p
+}
+
+/// A header on `prev` at `time` with `bits`, mined to meet them.
+fn mine_bits(prev: &bitcoin::block::Header, time: u32, bits: u32) -> bitcoin::block::Header {
+    let mut h = mine(prev, 0, vec![], 7, bits).header;
+    h.time = time;
+    h.nonce = 0;
+    while h.validate_pow(h.target()).is_err() {
+        h.nonce += 1;
+    }
+    h
+}
+
+/// A base header (height 0) and three more with `bits`, `step` seconds
+/// apart: the first retarget period. Returns the base and the three.
+fn first_period(bits: u32, step: u32) -> (bitcoin::block::Header, Vec<bitcoin::block::Header>) {
+    let mut base = genesis().header;
+    base.bits = CompactTarget::from_consensus(bits);
+    let mut hs: Vec<bitcoin::block::Header> = Vec::new();
+    let mut prev = base;
+    for _ in 0..3 {
+        let h = mine_bits(&prev, prev.time + step, bits);
+        hs.push(h);
+        prev = h;
+    }
+    (base, hs)
+}
+
+#[test]
+fn at_a_retarget_the_bits_must_be_exactly_what_core_computes() {
+    let p = short_signet_params();
+    // The period took 300 s for three blocks spaced 100 s: well under the
+    // 2400 s target, so the target shrinks (to a quarter at most).
+    let (base, hs) = first_period(0x1f7f_ffff, 400);
+    let last = *hs.last().unwrap();
+    let now = u64::from(last.time) + 10_000;
+    // timespan = 3 * 400 = 1200 of 2400: half the target.
+    let expected = 0x1f3f_ffff;
+    let mut chain = HeaderChain::with_params(p.clone(), 0, base);
+    chain.connect(&hs, now).unwrap();
+    for bits in [expected - 1, expected + 1, 0x1f2f_ffff, 0x1f7f_ffff] {
+        let h = mine_bits(&last, last.time + 400, bits);
+        let err = chain.check(&[h], now).unwrap_err();
+        assert!(
+            matches!(err, ChainError::BadDifficulty { height: 4, .. }),
+            "{bits:x}: {err:?}"
+        );
+    }
+    let h = mine_bits(&last, last.time + 400, expected);
+    chain.connect(&[h], now).unwrap();
+    assert_eq!(chain.tip_height(), 4);
+    // Between boundaries nothing may change.
+    let next = mine_bits(&h, h.time + 400, expected + 1);
+    assert!(matches!(
+        chain.check(&[next], now).unwrap_err(),
+        ChainError::BadDifficulty { height: 5, .. }
+    ));
+}
+
+#[test]
+fn an_honest_four_times_harder_retarget_survives_compact_rounding() {
+    // A quarter of 0x2014fcee's target is 0x53f3b.8 in the compact form's
+    // units, which rounds down to 0x20053f3b: just under a strict quarter.
+    // Bitcoin Core computes exactly that, so it must be accepted.
+    let p = short_signet_params();
+    let (base, hs) = first_period(0x2014_fcee, 1);
+    let last = *hs.last().unwrap();
+    let now = u64::from(last.time) + 10_000;
+    let h = mine_bits(&last, last.time + 1, 0x2005_3f3b);
+
+    // With the whole period known (exact rule).
+    let mut chain = HeaderChain::with_params(p.clone(), 0, base);
+    chain.connect(&hs, now).unwrap();
+    chain.connect(&[h], now).unwrap();
+    assert_eq!(chain.tip_height(), 4);
+
+    // Starting from a checkpoint inside the period, the first header of the
+    // period is unknown, so only Core's permitted range applies (also with
+    // the rounding): the same header is accepted, a harder one is not.
+    let mut chain = HeaderChain::with_params(p, 3, last);
+    chain.connect(&[h], now).unwrap();
+    assert_eq!(chain.tip_height(), 4);
+    let chain = HeaderChain::with_params(short_signet_params(), 3, last);
+    let too_hard = mine_bits(&last, last.time + 1, 0x2005_3f3a);
+    assert!(matches!(
+        chain.check(&[too_hard], now).unwrap_err(),
+        ChainError::BadDifficulty { height: 4, .. }
+    ));
+}
+
+#[test]
+fn the_retarget_matches_real_signet_and_cores_rounding() {
+    use trust_issues::chain::{next_work_required, permitted_difficulty_transition};
+    let p = bitcoin::params::Params::new(Network::Signet);
+    let bits = CompactTarget::from_consensus;
+    // Real signet, read from a local node: the period 328608..330623 took
+    // 1793327751 to 1794548120 at 0x1d14cd85, and block 330624 carries
+    // 0x1d14fcee.
+    assert_eq!(
+        next_work_required(bits(0x1d14_cd85), 1_793_327_751, 1_794_548_120, &p),
+        bits(0x1d14_fcee)
+    );
+    // Four times harder from the current signet bits rounds to 0x1d053f3b,
+    // a hair under a strict quarter (what the old check demanded).
+    assert_eq!(
+        next_work_required(bits(0x1d14_fcee), 1000, 1000 + 60, &p),
+        bits(0x1d05_3f3b)
+    );
+    assert!(
+        bitcoin::Target::from_compact(bits(0x1d05_3f3b))
+            < bitcoin::Target::from_compact(bits(0x1d14_fcee)).min_transition_threshold()
+    );
+    // Time running backwards counts as the fastest period, as in Core.
+    assert_eq!(
+        next_work_required(bits(0x1d14_fcee), 2000, 1000, &p),
+        bits(0x1d05_3f3b)
+    );
+    // Four times easier is capped at signet's limit.
+    assert_eq!(
+        next_work_required(bits(0x1e03_77ae), 0, 10 * 1_209_600, &p),
+        bits(0x1e03_77ae)
+    );
+    // Core's bound when the period's start is unknown, at 330624.
+    for (new, ok) in [
+        (0x1d14_fcee, true),
+        (0x1d05_3335, false),
+        (0x1d05_3361, true),
+        (0x1d14_fced, true),
+        (0x1d53_3614, true),
+        (0x1d53_3615, false),
+        (0x1e03_77ae, false),
+    ] {
+        assert_eq!(
+            permitted_difficulty_transition(&p, 330_624, bits(0x1d14_cd85), bits(new)),
+            ok,
+            "{new:x}"
+        );
+    }
+    assert!(!permitted_difficulty_transition(
+        &p,
+        330_625,
+        bits(0x1d14_fcee),
+        bits(0x1d14_fced)
+    ));
+}

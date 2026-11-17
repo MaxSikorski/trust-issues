@@ -13,7 +13,7 @@ use std::fmt;
 use bitcoin::block::Header;
 use bitcoin::params::Params;
 use bitcoin::pow::Work;
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, CompactTarget, Network, Target};
 
 /// Headers may be at most two hours ahead of our clock (Bitcoin's own rule).
 pub const MAX_FUTURE_SECS: u64 = 2 * 60 * 60;
@@ -93,6 +93,16 @@ pub struct HeaderChain {
 impl HeaderChain {
     /// Start from a trusted checkpoint header at a known height.
     pub fn new(network: Network, base_height: u32, base_header: Header) -> Self {
+        Self::with_params(Params::new(network), base_height, base_header)
+    }
+
+    /// [`HeaderChain::new`] with the network's consensus parameters
+    /// changed. For tests only: real signet retargets every 2016 blocks at
+    /// a target far too hard to mine in a test, so the difficulty tests use
+    /// a short interval and an easy limit to reach a retarget boundary.
+    #[doc(hidden)]
+    pub fn with_params(params: Params, base_height: u32, base_header: Header) -> Self {
+        let network = params.network;
         let base_hash = base_header.block_hash();
         let mut entries = HashMap::new();
         entries.insert(
@@ -104,7 +114,7 @@ impl HeaderChain {
             },
         );
         Self {
-            params: Params::new(network),
+            params,
             network,
             base_height,
             base_hash,
@@ -265,7 +275,7 @@ impl HeaderChain {
             }
             h.validate_pow(target)
                 .map_err(|_| ChainError::BadPow { hash })?;
-            self.check_difficulty(&prev, h, height)?;
+            self.check_difficulty(&prev, h, height, &checked)?;
             if u64::from(h.time) > now + MAX_FUTURE_SECS {
                 return Err(ChainError::TimeTooNew { hash });
             }
@@ -299,17 +309,42 @@ impl HeaderChain {
             if times.len() == 11 || cur.height == 0 {
                 break;
             }
-            let parent = cur.header.prev_blockhash;
-            cur = match batch.iter().rev().find(|(h, _)| *h == parent) {
-                Some((_, e)) => e.clone(),
-                None => self.entries.get(&parent)?.clone(),
-            };
+            cur = self.parent_of(&cur, batch)?;
         }
         times.sort_unstable();
         Some(times[times.len() / 2])
     }
 
-    fn check_difficulty(&self, prev: &Entry, h: &Header, height: u32) -> Result<(), ChainError> {
+    /// The parent of `e`, from the batch being checked or from what we
+    /// already know; `None` below the checkpoint.
+    fn parent_of(&self, e: &Entry, batch: &[(BlockHash, Entry)]) -> Option<Entry> {
+        let parent = e.header.prev_blockhash;
+        match batch.iter().rev().find(|(h, _)| *h == parent) {
+            Some((_, p)) => Some(p.clone()),
+            None => self.entries.get(&parent).cloned(),
+        }
+    }
+
+    /// Bitcoin Core's difficulty rule for this network (signet has no
+    /// minimum-difficulty exception; regtest never retargets): between
+    /// retarget boundaries `bits` can't change at all, and at a boundary it
+    /// must be exactly what `CalculateNextWorkRequired` gives from the
+    /// period's first and last headers.
+    ///
+    /// Just above a checkpoint the period's first header can be below it,
+    /// and so unknown. Then we apply Core's own bound for that case
+    /// (`PermittedDifficultyTransition`, used while it syncs headers): the
+    /// new target within 4x of the old one either way, both limits rounded
+    /// through the compact form as Core rounds them. That is looser than
+    /// exact (a slightly harder target passes), but harder only means more
+    /// work, and on signet every block still needs the signer's signature.
+    fn check_difficulty(
+        &self,
+        prev: &Entry,
+        h: &Header,
+        height: u32,
+        batch: &[(BlockHash, Entry)],
+    ) -> Result<(), ChainError> {
         let interval = self.params.difficulty_adjustment_interval() as u32;
         let bad = || ChainError::BadDifficulty {
             hash: h.block_hash(),
@@ -321,12 +356,32 @@ impl HeaderChain {
             }
             return Ok(());
         }
-        // A retarget boundary: the new target may move at most 4x either way.
-        let prev_t = prev.header.target();
-        let new_t = h.target();
-        if new_t < prev_t.min_transition_threshold()
-            || new_t > prev_t.max_transition_threshold(&self.params)
-        {
+        // Core's `pindexFirst`: the block `interval - 1` before `prev`.
+        let mut first = prev.clone();
+        for _ in 1..interval {
+            match self.parent_of(&first, batch) {
+                Some(p) => first = p,
+                None => {
+                    return if permitted_difficulty_transition(
+                        &self.params,
+                        height,
+                        prev.header.bits,
+                        h.bits,
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(bad())
+                    };
+                }
+            }
+        }
+        let expected = next_work_required(
+            prev.header.bits,
+            first.header.time,
+            prev.header.time,
+            &self.params,
+        );
+        if h.bits != expected {
             return Err(bad());
         }
         Ok(())
@@ -357,4 +412,84 @@ impl HeaderChain {
         }
         self.base_height
     }
+}
+
+/// Bitcoin Core's `CalculateNextWorkRequired` (src/pow.cpp): the `bits` a
+/// retarget block must carry, given the previous block's `bits` and the
+/// times of the period's first and last blocks. The time taken is clamped
+/// to a quarter and four times the target timespan, the old target is
+/// scaled by it, capped at the network's limit, then rounded down into the
+/// compact form exactly as Core's `GetCompact` does.
+pub fn next_work_required(
+    prev_bits: CompactTarget,
+    first_time: u32,
+    last_time: u32,
+    params: &Params,
+) -> CompactTarget {
+    let timespan = params.pow_target_timespan as i64;
+    let actual = (i64::from(last_time) - i64::from(first_time)).clamp(timespan / 4, timespan * 4);
+    retarget(prev_bits, actual as u64, params)
+}
+
+/// Bitcoin Core's `PermittedDifficultyTransition` (src/pow.cpp), for a
+/// network without minimum-difficulty blocks: at a retarget height, the
+/// new target must lie between the targets four times faster and four
+/// times slower would give, each rounded through the compact form; at any
+/// other height `bits` must not change.
+pub fn permitted_difficulty_transition(
+    params: &Params,
+    height: u32,
+    old_bits: CompactTarget,
+    new_bits: CompactTarget,
+) -> bool {
+    let interval = params.difficulty_adjustment_interval() as u32;
+    if !height.is_multiple_of(interval) {
+        return old_bits == new_bits;
+    }
+    let observed = Target::from_compact(new_bits);
+    let largest = retarget(old_bits, params.pow_target_timespan * 4, params);
+    let smallest = retarget(old_bits, params.pow_target_timespan / 4, params);
+    observed <= Target::from_compact(largest) && observed >= Target::from_compact(smallest)
+}
+
+/// `bnNew = old target * actual / timespan`, capped at the limit, as compact.
+fn retarget(prev_bits: CompactTarget, actual: u64, params: &Params) -> CompactTarget {
+    let prev = Target::from_compact(prev_bits).to_be_bytes();
+    let scaled = mul_div(prev, actual, params.pow_target_timespan)
+        .map(Target::from_be_bytes)
+        .unwrap_or(params.max_attainable_target);
+    scaled.min(params.max_attainable_target).to_compact_lossy()
+}
+
+/// `n * mul / div` for a 256-bit big-endian `n`, exactly (a 320-bit
+/// intermediate, so nothing wraps). `None` if the result needs more than
+/// 256 bits; the caller caps it at the network's limit anyway.
+fn mul_div(n: [u8; 32], mul: u64, div: u64) -> Option<[u8; 32]> {
+    // Little-endian 64-bit limbs.
+    let mut limbs = [0u64; 5];
+    for (i, limb) in limbs.iter_mut().take(4).enumerate() {
+        let start = 32 - 8 * (i + 1);
+        *limb = u64::from_be_bytes(n[start..start + 8].try_into().expect("8 bytes"));
+    }
+    let mut carry: u128 = 0;
+    for limb in limbs.iter_mut() {
+        let v = u128::from(*limb) * u128::from(mul) + carry;
+        *limb = v as u64;
+        carry = v >> 64;
+    }
+    let mut rem: u128 = 0;
+    for limb in limbs.iter_mut().rev() {
+        let v = (rem << 64) | u128::from(*limb);
+        *limb = (v / u128::from(div)) as u64;
+        rem = v % u128::from(div);
+    }
+    if limbs[4] != 0 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, limb) in limbs.iter().take(4).enumerate() {
+        let start = 32 - 8 * (i + 1);
+        out[start..start + 8].copy_from_slice(&limb.to_be_bytes());
+    }
+    Some(out)
 }

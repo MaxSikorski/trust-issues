@@ -26,17 +26,25 @@
 //! (P2SH, WITNESS, DERSIG, NULLDUMMY). Any other challenge is refused. The
 //! one thing we don't model is a solution scriptSig with non-push opcodes:
 //! Core could accept some of those, but no signet signer produces them, so
-//! we refuse them with their own error rather than guess.
+//! we refuse them with their own error rather than guess (and, since Core
+//! might accept the block, without blaming the source that served it).
+//!
+//! The checker needs secp256k1's verifier, which more than triples the
+//! browser demo's size, so it is built only with the `signet-check` cargo
+//! feature (part of `server`). Without it every signet block is refused
+//! with [`SignetError::NotBuilt`], and a node won't start on signet.
 
 use bitcoin::consensus::encode::Decodable;
-use bitcoin::hashes::Hash;
-use bitcoin::hex::FromHex;
-use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, ecdsa};
-use bitcoin::sighash::SighashCache;
-use bitcoin::transaction::Version;
+#[cfg(feature = "signet-check")]
 use bitcoin::{
-    Amount, Block, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    Amount, OutPoint, Script, Sequence, TxIn, TxOut,
+    hashes::Hash,
+    hex::FromHex,
+    secp256k1::{Message, PublicKey, Secp256k1, ecdsa},
+    sighash::SighashCache,
+    transaction::Version,
 };
+use bitcoin::{Block, ScriptBuf, Transaction, Witness};
 
 /// The 4 bytes that mark the signet solution inside the witness commitment.
 pub const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
@@ -47,14 +55,20 @@ pub const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
 pub const STANDARD_SIGNET_CHALLENGE: &str = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
 
 // Script limits Core's interpreter enforces (script/script.h).
+#[cfg(feature = "signet-check")]
 const MAX_SCRIPT_SIZE: usize = 10_000;
+#[cfg(feature = "signet-check")]
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+#[cfg(feature = "signet-check")]
 const MAX_STACK_SIZE: usize = 1000;
 const OP_PUSHDATA1: u8 = 0x4c;
 const OP_PUSHDATA2: u8 = 0x4d;
 const OP_PUSHDATA4: u8 = 0x4e;
+#[cfg(feature = "signet-check")]
 const OP_1NEGATE: u8 = 0x4f;
+#[cfg(feature = "signet-check")]
 const OP_1: u8 = 0x51;
+#[cfg(feature = "signet-check")]
 const OP_16: u8 = 0x60;
 const OP_RETURN: u8 = 0x6a;
 
@@ -74,6 +88,22 @@ pub enum SignetError {
     /// The solution doesn't satisfy the challenge (including no solution at
     /// all: the standard challenge needs a signature).
     BadSignature,
+    /// This build has no signet checker (no `signet-check` feature).
+    NotBuilt,
+}
+
+impl SignetError {
+    /// True if the block provably fails our signet's challenge. False when
+    /// we simply can't judge it (a solution or challenge we don't model, or
+    /// no checker in this build): refuse the block, but blame nobody.
+    pub fn proves_a_lie(&self) -> bool {
+        !matches!(
+            self,
+            SignetError::UnsupportedSolution
+                | SignetError::UnsupportedChallenge
+                | SignetError::NotBuilt
+        )
+    }
 }
 
 impl std::fmt::Display for SignetError {
@@ -91,6 +121,9 @@ impl std::fmt::Display for SignetError {
                 "signet solution uses opcodes this checker doesn't model; refused to be safe"
             }
             SignetError::BadSignature => "signet signature doesn't satisfy the challenge",
+            SignetError::NotBuilt => {
+                "this build has no signet signature checker (the `signet-check` feature); signet refused"
+            }
         };
         f.write_str(s)
     }
@@ -98,8 +131,16 @@ impl std::fmt::Display for SignetError {
 
 impl std::error::Error for SignetError {}
 
+/// Without the `signet-check` feature there is no checker: every block is
+/// refused, so nothing on signet is ever taken on trust.
+#[cfg(not(feature = "signet-check"))]
+pub fn check_block_solution(_block: &Block, _challenge: &[u8]) -> Result<(), SignetError> {
+    Err(SignetError::NotBuilt)
+}
+
 /// Check a block's signet solution against `challenge` (the challenge
 /// script's bytes). The genesis block needs none, as in Core.
+#[cfg(feature = "signet-check")]
 pub fn check_block_solution(block: &Block, challenge: &[u8]) -> Result<(), SignetError> {
     let standard = Vec::<u8>::from_hex(STANDARD_SIGNET_CHALLENGE).expect("constant is hex");
     if challenge != standard.as_slice() {
@@ -129,25 +170,51 @@ pub fn check_block_solution(block: &Block, challenge: &[u8]) -> Result<(), Signe
     }
 }
 
+/// The solution the checker would run for this block (Core's step 1): the
+/// scriptSig and witness found in the coinbase's witness commitment, or
+/// `None` if that commitment holds none. It ignores solution-like data
+/// anywhere else.
+pub fn find_solution(block: &Block) -> Result<Option<(ScriptBuf, Witness)>, SignetError> {
+    let coinbase = block.txdata.first().ok_or(SignetError::NoCoinbase)?;
+    let cidx = witness_commitment_index(coinbase).ok_or(SignetError::NoWitnessCommitment)?;
+    let found = split_solution(coinbase.output[cidx].script_pubkey.as_bytes())?;
+    Ok(found.map(|(_, script_sig, witness)| (script_sig, witness)))
+}
+
+/// The commitment script with the solution cut out, and the solution
+/// decoded as a scriptSig and a witness; `None` if there is no solution.
+type Split = Option<(Vec<u8>, ScriptBuf, Witness)>;
+
+fn split_solution(commitment: &[u8]) -> Result<Split, SignetError> {
+    let Some((replacement, solution)) = fetch_and_clear_commitment_section(commitment) else {
+        return Ok(None);
+    };
+    let mut r = solution.as_slice();
+    let script_sig =
+        ScriptBuf::consensus_decode(&mut r).map_err(|_| SignetError::MalformedSolution)?;
+    let witness = Witness::consensus_decode(&mut r).map_err(|_| SignetError::MalformedSolution)?;
+    if !r.is_empty() {
+        return Err(SignetError::MalformedSolution);
+    }
+    Ok(Some((replacement, script_sig, witness)))
+}
+
 /// Build Core's `to_spend` and `to_sign` virtual transactions
 /// (`SignetTxs::Create`).
+#[cfg(feature = "signet-check")]
 fn signet_txs(block: &Block, challenge: &[u8]) -> Result<(Transaction, Transaction), SignetError> {
     let coinbase = block.txdata.first().ok_or(SignetError::NoCoinbase)?;
     let cidx = witness_commitment_index(coinbase).ok_or(SignetError::NoWitnessCommitment)?;
 
     let mut modified_cb = coinbase.clone();
-    let commitment = modified_cb.output[cidx].script_pubkey.as_bytes();
     let mut script_sig = ScriptBuf::new();
     let mut witness = Witness::new();
-    if let Some((replacement, solution)) = fetch_and_clear_commitment_section(commitment) {
+    if let Some((replacement, s, w)) =
+        split_solution(modified_cb.output[cidx].script_pubkey.as_bytes())?
+    {
         modified_cb.output[cidx].script_pubkey = ScriptBuf::from_bytes(replacement);
-        let mut r = solution.as_slice();
-        script_sig =
-            ScriptBuf::consensus_decode(&mut r).map_err(|_| SignetError::MalformedSolution)?;
-        witness = Witness::consensus_decode(&mut r).map_err(|_| SignetError::MalformedSolution)?;
-        if !r.is_empty() {
-            return Err(SignetError::MalformedSolution);
-        }
+        script_sig = s;
+        witness = w;
     }
     // No solution is allowed by Core (for an OP_TRUE challenge); with ours it
     // simply fails the signature check below.
@@ -202,7 +269,7 @@ fn signet_txs(block: &Block, challenge: &[u8]) -> Result<(Transaction, Transacti
 
 /// Core's `GetWitnessCommitmentIndex`: the last coinbase output that is at
 /// least 38 bytes and starts `OP_RETURN 0x24 aa21a9ed`.
-fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
+pub(crate) fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
     coinbase.output.iter().rposition(|o| {
         let s = o.script_pubkey.as_bytes();
         s.len() >= 38 && s[..6] == [OP_RETURN, 0x24, 0xaa, 0x21, 0xa9, 0xed]
@@ -283,6 +350,7 @@ fn fetch_and_clear_commitment_section(script: &[u8]) -> Option<(Vec<u8>, Vec<u8>
 
 /// Run a scriptSig that may only push data, the way Core's interpreter
 /// would, and return the stack. Non-push opcodes are refused as unsupported.
+#[cfg(feature = "signet-check")]
 fn push_only_stack(script_sig: &Script) -> Result<Vec<Vec<u8>>, SignetError> {
     let bytes = script_sig.as_bytes();
     if bytes.len() > MAX_SCRIPT_SIZE {
@@ -319,6 +387,7 @@ fn push_only_stack(script_sig: &Script) -> Result<Vec<Vec<u8>>, SignetError> {
 /// anything below the dummy is left alone (CLEANSTACK isn't a signet flag).
 /// A non-empty signature must be strict DER (DERSIG); then the keys are
 /// tried in Core's order, last pushed first, and one match is enough.
+#[cfg(feature = "signet-check")]
 fn check_multisig_1_of_2(
     stack: &[Vec<u8>],
     to_sign: &Transaction,
@@ -351,6 +420,7 @@ fn check_multisig_1_of_2(
 /// Core's `CheckECDSASignature` for input 0 with legacy (pre-segwit)
 /// signature hashing: the last byte is the sighash type, the rest is parsed
 /// leniently and normalised to low S before verifying, as Core does.
+#[cfg(feature = "signet-check")]
 fn check_ecdsa(sig: &[u8], key: &[u8], to_sign: &Transaction, script_code: &Script) -> bool {
     let Some((&hash_type, der)) = sig.split_last() else {
         return false;
@@ -375,6 +445,7 @@ fn check_ecdsa(sig: &[u8], key: &[u8], to_sign: &Transaction, script_code: &Scri
 
 /// BIP66 strict DER, including the trailing sighash byte (Core's
 /// `IsValidSignatureEncoding`).
+#[cfg(feature = "signet-check")]
 fn is_valid_signature_encoding(sig: &[u8]) -> bool {
     let n = sig.len();
     if !(9..=73).contains(&n) || sig[0] != 0x30 || usize::from(sig[1]) != n - 3 {

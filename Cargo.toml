@@ -13,7 +13,13 @@ publish = false
 # what the browser version (web/) is built from.
 [features]
 default = ["server"]
+# Checking signet block signatures (BIP325) needs secp256k1's verifier,
+# which more than triples the browser demo's size. The demo runs on
+# regtest and doesn't need it, so the check is a feature of its own.
+# Without it a node refuses to run on signet at all (it fails closed).
+signet-check = []
 server = [
+    "signet-check",
     "dep:tokio",
     "dep:reqwest",
     "dep:axum",

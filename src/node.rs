@@ -225,10 +225,30 @@ pub struct Node {
     /// Cleaned names of RPC methods clients asked for that we don't support
     /// (at most [`UNSUPPORTED_RPC_MAX`]); shown on `/status`.
     unsupported_rpc: Mutex<BTreeSet<String>>,
+    /// One block download per hash at a time (see [`Node::fetch_block_from`]).
+    in_flight: Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
+    /// Blocks refused because their signet solution can't be judged here,
+    /// with why (see [`Node::fetch_block_from`]).
+    unjudged: Mutex<HashMap<BlockHash, String>>,
 }
 
 /// How many distinct unsupported RPC method names to remember.
 pub const UNSUPPORTED_RPC_MAX: usize = 64;
+
+/// How many unjudgeable blocks to remember (forgotten all at once past this).
+const UNJUDGED_MAX: usize = 1024;
+
+/// What fetching a block from one source came to.
+enum Fetched {
+    /// Proven to be the block (and on signet, signed); now in the cache.
+    Verified(Arc<Vec<u8>>),
+    /// The source didn't supply it (not found, down, rate-limited).
+    Missing,
+    /// The source served something provably false and is marked bad.
+    Lied,
+    /// A real copy of the block, but we can't judge its signet signature.
+    Unjudged(String),
+}
 
 /// How many below-checkpoint headers to remember.
 const DEEP_CACHE_MAX: usize = 4096;
@@ -308,6 +328,8 @@ impl Node {
             deep: Mutex::new(DeepHeaders::default()),
             deep_lookup: futures::lock::Mutex::new(()),
             unsupported_rpc: Mutex::new(BTreeSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            unjudged: Mutex::new(HashMap::new()),
         }
     }
 
@@ -775,7 +797,16 @@ impl Node {
 
     /// Check every source's network, then settle on a checkpoint. Safe to
     /// call again until it succeeds.
+    ///
+    /// A build without the `signet-check` feature (the browser demo) has no
+    /// signet signature checker, so it refuses to start on signet at all
+    /// rather than follow headers it can't check: it never becomes ready.
     pub async fn start(&self) -> Result<(), String> {
+        if self.settings.network == Network::Signet && !cfg!(feature = "signet-check") {
+            let why = "this build can't check signet block signatures (no `signet-check` feature); refusing to run on signet";
+            self.set_alarm("signet-check-missing", AlarmLevel::Critical, why.into());
+            return Err(why.into());
+        }
         let unchecked: Vec<usize> = (0..self.sources.len())
             .filter(|&i| lock(&self.sources[i].state).genesis_ok.is_none())
             .collect();
@@ -866,6 +897,9 @@ impl Node {
         }
         let hash = first.expect("checked non-empty");
         let header = self.fetch_checkpoint_header(height, hash).await?;
+        if self.settings.network == Network::Signet && height > 0 {
+            self.prove_bootstrap_block(height, hash).await?;
+        }
         warn!(
             height,
             %hash,
@@ -873,6 +907,35 @@ impl Node {
             hashes.len()
         );
         Ok((height, header))
+    }
+
+    /// On signet, agreement isn't enough for an automatic starting point:
+    /// every signet shares one genesis block, so two explorers following
+    /// another signet would agree on a checkpoint from it. Like every block
+    /// we follow, the checkpoint's block must be proven and signed for our
+    /// signet (it then sits in the block cache, ready for `getblock`). If
+    /// no source can give a copy that passes, we don't start from it.
+    async fn prove_bootstrap_block(&self, height: u32, hash: BlockHash) -> Result<(), String> {
+        let mut why = "no source could supply it".to_string();
+        for i in self.rotated() {
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(_) => return Ok(()),
+                Fetched::Missing => {}
+                Fetched::Lied => why = "it isn't signed for our signet or doesn't match".into(),
+                Fetched::Unjudged(w) => {
+                    why = w;
+                    break;
+                }
+            }
+        }
+        self.set_alarm(
+            "starting",
+            AlarmLevel::Critical,
+            format!("sources agree on block {height} ({hash}), but {why}; not starting from it"),
+        );
+        Err(format!(
+            "the agreed starting block {hash} couldn't be proven: {why}"
+        ))
     }
 
     // ---------- the polling loop ----------
@@ -962,6 +1025,8 @@ impl Node {
         match result {
             Ok(c) => {
                 if c.new_best {
+                    // Following again: an earlier unjudgeable block is behind us.
+                    self.clear_alarm("signet-unjudged");
                     let chain = self.read_chain();
                     info!(height = chain.tip_height(), hash = %chain.tip_hash(), source = %self.name(i), "new tip");
                     if c.reorg_depth > 0 {
@@ -984,36 +1049,109 @@ impl Node {
     /// feed us its chain. For each new header (oldest first) we fetch the
     /// block from the source that offered it, prove it matches the header
     /// and check its signature. The verified block goes into the block
-    /// cache, so this costs no extra requests overall: LND and Core
-    /// Lightning fetch every new block right after, and get it from there.
+    /// cache, so in steady state this costs no extra requests overall: LND
+    /// and Core Lightning fetch every new block right after, and get it
+    /// from there.
+    ///
+    /// Catching up is different: every new block is fetched before its
+    /// header is followed, so a long catch-up costs about two requests per
+    /// block (its header from each source that offers it, plus one download
+    /// of the block, shared between sources). With a bootstrap checkpoint
+    /// 6 blocks down, or after a short outage, that's a handful; a node
+    /// that was off for a day re-reads about 144 blocks.
     ///
     /// Returns how many headers from the start are proven signed. A block
     /// the source can't supply right now stops the run there (we connect
-    /// what's proven and try the rest next round). A block that fails its
-    /// checks is a provable lie: the source is marked bad and `None` is
-    /// returned, so none of its headers are used this round.
+    /// what's proven and try the rest next round), and so does a block
+    /// whose signature we can't judge (see [`Node::fetch_block_from`]). A
+    /// block that fails its checks is a provable lie: the source is marked
+    /// bad and `None` is returned, so none of its headers are used this
+    /// round.
     async fn signed_prefix(&self, i: usize, headers: &[Header]) -> Option<usize> {
         for (n, header) in headers.iter().enumerate() {
             let hash = header.block_hash();
-            if self.read_chain().contains(&hash) || lock(&self.blocks).get(&hash).is_some() {
-                // Already checked: everything in the chain or the cache
-                // went through `verify_block_for` on this network.
+            if self.read_chain().contains(&hash) {
+                // Already checked: everything in the chain went through
+                // `verify_block_for` on this network.
                 continue;
             }
-            let raw = match self
-                .call(i, move |s| async move { s.raw_block(hash).await })
-                .await
-            {
-                Ok(raw) => raw,
-                Err(_) => return Some(n),
-            };
-            if let Err(e) = verify_block_for(self.settings.network, &raw, hash) {
-                self.mark_bad(i, format!("served block {hash} that fails checks: {e}"));
-                return None;
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(_) => {}
+                Fetched::Missing | Fetched::Unjudged(_) => return Some(n),
+                Fetched::Lied => return None,
             }
-            lock(&self.blocks).insert(hash, Arc::new(raw));
         }
         Some(headers.len())
+    }
+
+    /// Get block `hash` from source `i` and prove it is that block (and, on
+    /// signet, signed for our signet) before it goes into the cache. Only
+    /// one download per block runs at a time: sources are polled together
+    /// and usually offer the same new block, so the others wait and then
+    /// take it from the cache. A body that fails is blamed on the source
+    /// that served it, and the next caller asks its own source.
+    ///
+    /// A signet solution this checker doesn't model is refused but blamed on
+    /// nobody (Core might accept it), with a warning; it's remembered so the
+    /// block isn't downloaded again every round. That verdict belongs to the
+    /// block, not the copy: the body is proven against the header first,
+    /// and the solution is inside the coinbase the header commits to.
+    async fn fetch_block_from(&self, i: usize, hash: BlockHash) -> Fetched {
+        let slot = lock(&self.in_flight).entry(hash).or_default().clone();
+        let guard = slot.lock().await;
+        let out = self.fetch_block_once(i, hash).await;
+        drop(guard);
+        let mut in_flight = lock(&self.in_flight);
+        // The map's copy and ours: nobody else is waiting on this slot.
+        if in_flight
+            .get(&hash)
+            .is_some_and(|s| Arc::strong_count(s) <= 2)
+        {
+            in_flight.remove(&hash);
+        }
+        out
+    }
+
+    async fn fetch_block_once(&self, i: usize, hash: BlockHash) -> Fetched {
+        // Whoever held the slot before us may have settled it.
+        if let Some(raw) = lock(&self.blocks).get(&hash) {
+            return Fetched::Verified(raw);
+        }
+        if let Some(why) = lock(&self.unjudged).get(&hash) {
+            return Fetched::Unjudged(why.clone());
+        }
+        let Ok(raw) = self
+            .call(i, move |s| async move { s.raw_block(hash).await })
+            .await
+        else {
+            return Fetched::Missing;
+        };
+        match verify_block_for(self.settings.network, &raw, hash) {
+            Ok(_) => {
+                let raw = Arc::new(raw);
+                lock(&self.blocks).insert(hash, raw.clone());
+                Fetched::Verified(raw)
+            }
+            Err(e) if e.proves_a_lie() => {
+                self.mark_bad(i, format!("served block {hash} that fails checks: {e}"));
+                Fetched::Lied
+            }
+            Err(e) => {
+                let why = format!("block {hash}: {e}");
+                warn!(%hash, error = %e, "refusing a block we can't judge; no source blamed");
+                self.set_alarm(
+                    "signet-unjudged",
+                    AlarmLevel::Warning,
+                    format!("not following or serving {why}; no source is blamed, since Bitcoin Core may accept it"),
+                );
+                let mut unjudged = lock(&self.unjudged);
+                if unjudged.len() >= UNJUDGED_MAX {
+                    unjudged.clear();
+                }
+                unjudged.insert(hash, why.clone());
+                Fetched::Unjudged(why)
+            }
+        }
     }
 
     fn read_chain(&self) -> std::sync::RwLockReadGuard<'_, HeaderChain> {
@@ -1195,21 +1333,15 @@ impl Node {
             return Ok(raw);
         }
         for i in self.rotated() {
-            match self
-                .call(i, move |s| async move { s.raw_block(hash).await })
-                .await
-            {
-                Ok(raw) => match verify_block_for(self.settings.network, &raw, hash) {
-                    Ok(_) => {
-                        let raw = Arc::new(raw);
-                        lock(&self.blocks).insert(hash, raw.clone());
-                        return Ok(raw);
-                    }
-                    Err(e) => {
-                        self.mark_bad(i, format!("served block {hash} that fails checks: {e}"))
-                    }
-                },
-                Err(_) => continue,
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(raw) => return Ok(raw),
+                Fetched::Unjudged(why) => {
+                    return Err(RpcError::new(
+                        RPC_MISC_ERROR,
+                        format!("Block refused (no source blamed): {why}"),
+                    ));
+                }
+                Fetched::Missing | Fetched::Lied => continue,
             }
         }
         Err(RpcError::new(
@@ -1705,4 +1837,82 @@ fn most_common(errors: Vec<RpcError>) -> Option<RpcError> {
 /// Serialize a header to hex (for `getblockheader` with verbose=false).
 pub fn header_hex(h: &Header) -> String {
     serialize(h).to_lower_hex_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proof::verify_block_for;
+
+    fn settings(network: Network) -> Settings {
+        Settings {
+            network,
+            checkpoint: Some((0, bitcoin::constants::genesis_block(network).block_hash())),
+            fee_ceiling_sat_vb: 1000.0,
+            requests_per_sec: 2.0,
+            burst: 10.0,
+            jitter: || 0.0,
+        }
+    }
+
+    fn genesis_raw(network: Network) -> (Vec<u8>, BlockHash) {
+        let g = bitcoin::constants::genesis_block(network);
+        (serialize(&g), g.block_hash())
+    }
+
+    /// The browser build (`--no-default-features`) has no signet checker:
+    /// every signet block is refused and a node won't start on signet.
+    /// Regtest, which the demo uses, is unaffected.
+    #[cfg(not(feature = "signet-check"))]
+    #[test]
+    fn without_the_signet_check_feature_signet_is_refused() {
+        use crate::proof::ProofError;
+        use crate::signet::SignetError;
+
+        let (raw, hash) = genesis_raw(Network::Signet);
+        assert_eq!(
+            verify_block_for(Network::Signet, &raw, hash).unwrap_err(),
+            ProofError::BadSignetSignature(SignetError::NotBuilt)
+        );
+        let node = Node::new(
+            settings(Network::Signet),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        let err = futures::executor::block_on(node.start()).unwrap_err();
+        assert!(err.contains("signet-check"), "{err}");
+        futures::executor::block_on(node.tick());
+        assert!(!node.is_ready());
+        assert_eq!(
+            node.alarms()["signet-check-missing"].level,
+            AlarmLevel::Critical
+        );
+
+        let (raw, hash) = genesis_raw(Network::Regtest);
+        assert!(verify_block_for(Network::Regtest, &raw, hash).is_ok());
+        let node = Node::new(
+            settings(Network::Regtest),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        futures::executor::block_on(node.start()).expect("regtest starts");
+        assert!(node.is_ready());
+    }
+
+    /// The counterpart: with the checker built in (the real program),
+    /// signet starts and its genesis block passes.
+    #[cfg(feature = "signet-check")]
+    #[tokio::test]
+    async fn with_the_signet_check_feature_signet_runs() {
+        let (raw, hash) = genesis_raw(Network::Signet);
+        assert!(verify_block_for(Network::Signet, &raw, hash).is_ok());
+        let node = Node::new(
+            settings(Network::Signet),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        node.start().await.expect("signet starts");
+        assert!(node.is_ready());
+        assert!(!node.alarms().contains_key("signet-check-missing"));
+    }
 }

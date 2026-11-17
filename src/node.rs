@@ -13,16 +13,17 @@ use crate::time::Instant;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::{DisplayHex, FromHex};
+use bitcoin::pow::Work;
 use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use crate::chain::HeaderChain;
+use crate::chain::{ChainError, HeaderChain, derive_target};
 use crate::fees;
 use crate::limits::{BACKOFF_CAP, TokenBucket, backoff};
-use crate::proof::{verify_block_for, verify_merkle_branch, verify_tx};
+use crate::proof::{coinbase_height_is, verify_block_for, verify_merkle_branch, verify_tx};
 use crate::source::{FeeMap, Source, SourceError};
 
 /// How deep below the agreed tip a bootstrap checkpoint is taken.
@@ -52,6 +53,13 @@ pub const MIN_AGREEING: usize = 2;
 /// before asking it once more. Longer than that (a long `Retry-After`), we
 /// fail closed instead of holding the wallet's RPC call open.
 pub const OLD_BLOCK_RETRY_MAX_WAIT: Duration = Duration::from_secs(15);
+/// How long a caller waits for someone else's download of the same block
+/// before fetching it from its own source. Long enough for a healthy
+/// download over Tor (a few seconds for a 4 MB block) to finish and be
+/// shared; short enough that one stalled explorer (its request budget,
+/// then the 90 s HTTP timeout) can't hold up a ready one, well inside
+/// LND's and Core Lightning's 60 s RPC timeouts.
+pub const IN_FLIGHT_WAIT: Duration = Duration::from_secs(10);
 
 /// Unix seconds. Injected so tests can move time deterministically.
 pub trait Clock: Send + Sync {
@@ -230,6 +238,56 @@ pub struct Node {
     /// Blocks refused because their signet solution can't be judged here,
     /// with why (see [`Node::fetch_block_from`]).
     unjudged: Mutex<HashMap<BlockHash, String>>,
+    /// Unjudgeable blocks that stopped us following a source's chain, with
+    /// the work their branch would have and why. The warning stays while
+    /// one of them could still be the best chain (see
+    /// [`Node::refresh_unjudged_alarm`]).
+    blocked_unjudged: Mutex<HashMap<BlockHash, (Work, String)>>,
+    /// The retarget height we're holding back at, if any (see
+    /// [`Node::poll_tip`]).
+    retarget_hold: Mutex<Option<u32>>,
+}
+
+/// One caller's share of a block's download slot. Dropping it (normally or
+/// because the caller gave up) removes the slot once nobody else holds it,
+/// so a cancelled download leaves nothing behind.
+struct InFlightEntry<'a> {
+    map: &'a Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
+    hash: BlockHash,
+    slot: Option<Arc<futures::lock::Mutex<()>>>,
+}
+
+impl<'a> InFlightEntry<'a> {
+    fn join(
+        map: &'a Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
+        hash: BlockHash,
+    ) -> Self {
+        let slot = lock(map).entry(hash).or_default().clone();
+        Self {
+            map,
+            hash,
+            slot: Some(slot),
+        }
+    }
+
+    fn slot(&self) -> &futures::lock::Mutex<()> {
+        self.slot.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for InFlightEntry<'_> {
+    fn drop(&mut self) {
+        // Every clone is made and dropped under the map's lock, so the
+        // count is exact: 1 means only the map holds it now.
+        let mut map = lock(self.map);
+        drop(self.slot.take());
+        if map
+            .get(&self.hash)
+            .is_some_and(|s| Arc::strong_count(s) == 1)
+        {
+            map.remove(&self.hash);
+        }
+    }
 }
 
 /// How many distinct unsupported RPC method names to remember.
@@ -330,6 +388,8 @@ impl Node {
             unsupported_rpc: Mutex::new(BTreeSet::new()),
             in_flight: Mutex::new(HashMap::new()),
             unjudged: Mutex::new(HashMap::new()),
+            blocked_unjudged: Mutex::new(HashMap::new()),
+            retarget_hold: Mutex::new(None),
         }
     }
 
@@ -523,6 +583,14 @@ impl Node {
                 "sources' answer contradicts our checkpoint",
             ));
         }
+        let genesis = bitcoin::constants::genesis_block(self.settings.network).block_hash();
+        if winner == genesis && height != 0 {
+            // Genesis is the block whose parent is all zeros: height 0 only.
+            return Err(RpcError::new(
+                RPC_MISC_ERROR,
+                "sources gave the genesis block for a later height",
+            ));
+        }
         if self.read_chain().contains(&winner) {
             // A block on our proven chain can't also be an old one below it.
             return Err(RpcError::new(
@@ -533,7 +601,7 @@ impl Node {
         let hash = winner;
         let answers: Vec<(usize, BlockHash)> =
             answers.into_iter().filter(|(_, h)| *h == hash).collect();
-        let max_target = bitcoin::params::Params::new(self.settings.network).max_attainable_target;
+        let params = bitcoin::params::Params::new(self.settings.network);
         for &(i, _) in &answers {
             let Ok(header) = self
                 .call(i, move |s| async move { s.header(hash).await })
@@ -541,11 +609,9 @@ impl Node {
             else {
                 continue;
             };
-            let target = header.target();
-            if header.block_hash() != hash
-                || target > max_target
-                || header.validate_pow(target).is_err()
-            {
+            let pow_ok =
+                derive_target(header.bits, &params).is_some_and(|t| header.validate_pow(t).is_ok());
+            if header.block_hash() != hash || !pow_ok {
                 self.mark_bad(i, format!("served a bad header for old block {hash}"));
                 continue;
             }
@@ -836,12 +902,25 @@ impl Node {
             }
             return Ok(genesis.header);
         }
+        if hash == genesis.block_hash() {
+            return Err(format!(
+                "the genesis block can't be the checkpoint at height {height}"
+            ));
+        }
+        let params = bitcoin::params::Params::new(self.settings.network);
         for i in self.rotated() {
             match self
                 .call(i, move |s| async move { s.header(hash).await })
                 .await
             {
-                Ok(h) if h.block_hash() == hash => return Ok(h),
+                Ok(h) if h.block_hash() == hash => {
+                    // The header is the one this hash names, so if it
+                    // misses its own target the hash itself is no block.
+                    if !derive_target(h.bits, &params).is_some_and(|t| h.validate_pow(t).is_ok()) {
+                        return Err(format!("the checkpoint {hash} fails its proof of work"));
+                    }
+                    return Ok(h);
+                }
                 Ok(_) => self.mark_bad(i, format!("served a header that doesn't hash to {hash}")),
                 Err(_) => {}
             }
@@ -896,7 +975,19 @@ impl Node {
             return Err(format!("sources disagree about block {height}"));
         }
         let hash = first.expect("checked non-empty");
-        let header = self.fetch_checkpoint_header(height, hash).await?;
+        let header = match self.fetch_checkpoint_header(height, hash).await {
+            Ok(h) => h,
+            Err(why) => {
+                self.set_alarm(
+                    "starting",
+                    AlarmLevel::Critical,
+                    format!(
+                        "sources agree on block {height} ({hash}), but {why}; not starting from it"
+                    ),
+                );
+                return Err(why);
+            }
+        };
         if self.settings.network == Network::Signet && height > 0 {
             self.prove_bootstrap_block(height, hash).await?;
         }
@@ -913,13 +1004,25 @@ impl Node {
     /// every signet shares one genesis block, so two explorers following
     /// another signet would agree on a checkpoint from it. Like every block
     /// we follow, the checkpoint's block must be proven and signed for our
-    /// signet (it then sits in the block cache, ready for `getblock`). If
-    /// no source can give a copy that passes, we don't start from it.
+    /// signet (it then sits in the block cache, ready for `getblock`), and
+    /// its coinbase must name the height the sources gave it (BIP34): a
+    /// real block offered at the wrong height would put every later height
+    /// off. If no source can give a copy that passes, we don't start from it.
     async fn prove_bootstrap_block(&self, height: u32, hash: BlockHash) -> Result<(), String> {
         let mut why = "no source could supply it".to_string();
         for i in self.rotated() {
             match self.fetch_block_from(i, hash).await {
-                Fetched::Verified(_) => return Ok(()),
+                Fetched::Verified(raw) => {
+                    let at_height = deserialize::<bitcoin::Block>(&raw)
+                        .is_ok_and(|b| coinbase_height_is(&b, height));
+                    if at_height {
+                        return Ok(());
+                    }
+                    // The block is proven, so its height is a fact; the
+                    // sources that put it here all claimed otherwise.
+                    why = format!("its coinbase says it isn't at height {height}");
+                    break;
+                }
                 Fetched::Missing => {}
                 Fetched::Lied => why = "it isn't signed for our signet or doesn't match".into(),
                 Fetched::Unjudged(w) => {
@@ -956,6 +1059,7 @@ impl Node {
 
         let list = self.usable_list();
         join_all(list.into_iter().map(|i| self.poll_tip(i))).await;
+        self.refresh_unjudged_alarm();
         let now = self.clock.now();
         self.update_lag(now);
         self.refresh_fees_if_due(now).await;
@@ -1004,9 +1108,45 @@ impl Node {
         let now = self.clock.now();
         // The cheap checks first (links, proof of work, difficulty, times),
         // so a bad header never costs us a block download.
-        if let Err(e) = self.read_chain().check(&headers, now) {
-            self.mark_bad(i, e.to_string());
-            return;
+        let mut checked = self.read_chain().check(&headers, now);
+        if let Err(ChainError::NeedPeriodStart { height, .. }) = checked
+            && self.load_period_start(height).await
+        {
+            checked = self.read_chain().check(&headers, now);
+        }
+        match checked {
+            Ok(()) => {}
+            Err(
+                ChainError::NeedPeriodStart { at, .. }
+                | ChainError::UnprovenRetarget { height: at, .. },
+            ) => {
+                // We can't check the retarget header exactly yet, or what
+                // we'd check it against isn't proven: follow the headers
+                // before it, hold it back, and blame nobody.
+                // (A missing first header was already reported, with why,
+                // by `load_period_start`.)
+                let reported = *lock(&self.retarget_hold) == Some(at);
+                if let Err(e) = &checked
+                    && (!reported || matches!(e, ChainError::UnprovenRetarget { .. }))
+                {
+                    self.hold_retarget(at, e.to_string());
+                }
+                let Some(parent) = self.read_chain().height_of(&headers[0].prev_blockhash) else {
+                    return;
+                };
+                headers.truncate(at.saturating_sub(parent + 1) as usize);
+                if headers.is_empty() {
+                    return;
+                }
+                if let Err(e) = self.read_chain().check(&headers, now) {
+                    self.mark_bad(i, e.to_string());
+                    return;
+                }
+            }
+            Err(e) => {
+                self.mark_bad(i, e.to_string());
+                return;
+            }
         }
         if self.settings.network == Network::Signet {
             match self.signed_prefix(i, &headers).await {
@@ -1025,9 +1165,14 @@ impl Node {
         match result {
             Ok(c) => {
                 if c.new_best {
-                    // Following again: an earlier unjudgeable block is behind us.
-                    self.clear_alarm("signet-unjudged");
+                    // A getblock refusal is reported until the next block.
+                    self.clear_alarm("signet-unjudged-getblock");
                     let chain = self.read_chain();
+                    let hold = *lock(&self.retarget_hold);
+                    if hold.is_some_and(|at| chain.tip_height() >= at) {
+                        *lock(&self.retarget_hold) = None;
+                        self.clear_alarm("retarget-held");
+                    }
                     info!(height = chain.tip_height(), hash = %chain.tip_hash(), source = %self.name(i), "new tip");
                     if c.reorg_depth > 0 {
                         warn!(
@@ -1077,39 +1222,150 @@ impl Node {
             }
             match self.fetch_block_from(i, hash).await {
                 Fetched::Verified(_) => {}
-                Fetched::Missing | Fetched::Unjudged(_) => return Some(n),
+                Fetched::Missing => return Some(n),
+                Fetched::Unjudged(why) => {
+                    // The work this block's branch would have, to tell
+                    // when our chain has gone past it.
+                    let chain = self.read_chain();
+                    let base = chain.work_of(&headers[0].prev_blockhash);
+                    if let Some(base) = base {
+                        let work = headers[..=n].iter().fold(base, |w, h| w + h.work());
+                        let mut blocked = lock(&self.blocked_unjudged);
+                        if blocked.len() >= UNJUDGED_MAX {
+                            blocked.clear();
+                        }
+                        blocked.insert(hash, (work, why));
+                    }
+                    return Some(n);
+                }
                 Fetched::Lied => return None,
             }
         }
         Some(headers.len())
     }
 
+    /// The warning about an unjudgeable block stays up while any block we
+    /// refused that way could still be the best chain: until our tip has
+    /// at least as much work as its branch would. A block refused again
+    /// from the cache counts again (it was recorded again).
+    fn refresh_unjudged_alarm(&self) {
+        let tip_work = self.read_chain().tip_work();
+        let mut blocked = lock(&self.blocked_unjudged);
+        blocked.retain(|_, (work, _)| *work > tip_work);
+        match blocked.values().next() {
+            Some((_, why)) => {
+                let why = why.clone();
+                drop(blocked);
+                self.set_alarm(
+                    "signet-unjudged",
+                    AlarmLevel::Warning,
+                    format!(
+                        "not following {why}; no source is blamed, since Bitcoin Core may accept it"
+                    ),
+                );
+            }
+            None => {
+                drop(blocked);
+                self.clear_alarm("signet-unjudged");
+            }
+        }
+    }
+
+    /// Get the first header of the checkpoint's retarget period from two
+    /// agreeing sources (the old-block path: cross-checked, its proof of
+    /// work checked) and give it to the chain. False if that isn't
+    /// possible right now; the retarget header then waits.
+    ///
+    /// Only signet retargets among the networks we run on (regtest never
+    /// does), and a build without the `signet-check` feature won't run on
+    /// signet, so that build never gets here; it leaves the old-block
+    /// lookup out, which keeps the browser demo small.
+    async fn load_period_start(&self, height: u32) -> bool {
+        #[cfg(feature = "signet-check")]
+        let found = match self.deep_hash_at(height).await {
+            Ok(hash) => self
+                .deep_header(&hash)
+                .ok_or_else(|| "its header wasn't kept".to_string()),
+            Err(e) => Err(e.message),
+        };
+        #[cfg(not(feature = "signet-check"))]
+        let found: Result<(u32, Header), String> =
+            Err("this build doesn't look up old blocks for retargets".into());
+        let added = found.and_then(|(_, header)| {
+            self.chain
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_period_start(height, header)
+        });
+        match added {
+            Ok(()) => true,
+            Err(why) => {
+                warn!(height, error = %why, "can't get the retarget period's first header yet");
+                self.hold_retarget(
+                    height + bitcoin::params::Params::new(self.settings.network)
+                        .difficulty_adjustment_interval() as u32,
+                    format!("the retarget needs the block at height {height} (below our checkpoint) and {why}"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Hold back the retarget header at `at`, with a warning saying why.
+    fn hold_retarget(&self, at: u32, why: String) {
+        *lock(&self.retarget_hold) = Some(at);
+        self.set_alarm(
+            "retarget-held",
+            AlarmLevel::Warning,
+            format!("not following past height {at} yet: {why}; no source is blamed"),
+        );
+    }
+
     /// Get block `hash` from source `i` and prove it is that block (and, on
-    /// signet, signed for our signet) before it goes into the cache. Only
-    /// one download per block runs at a time: sources are polled together
-    /// and usually offer the same new block, so the others wait and then
-    /// take it from the cache. A body that fails is blamed on the source
-    /// that served it, and the next caller asks its own source.
+    /// signet, signed for our signet) before it goes into the cache.
+    /// Usually one download per block runs at a time: sources are polled
+    /// together and usually offer the same new block, so the others wait
+    /// and then take it from the cache. They wait at most
+    /// [`IN_FLIGHT_WAIT`], then download it from their own source (once),
+    /// so a stalled explorer can't hold up a ready one. A body that fails
+    /// is blamed on the source that served it, and the next caller asks its
+    /// own source.
     ///
     /// A signet solution this checker doesn't model is refused but blamed on
-    /// nobody (Core might accept it), with a warning; it's remembered so the
-    /// block isn't downloaded again every round. That verdict belongs to the
+    /// nobody (Core might accept it); the callers raise the warning. It's
+    /// remembered so the block isn't downloaded again every round. That verdict belongs to the
     /// block, not the copy: the body is proven against the header first,
     /// and the solution is inside the coinbase the header commits to.
     async fn fetch_block_from(&self, i: usize, hash: BlockHash) -> Fetched {
-        let slot = lock(&self.in_flight).entry(hash).or_default().clone();
-        let guard = slot.lock().await;
-        let out = self.fetch_block_once(i, hash).await;
-        drop(guard);
-        let mut in_flight = lock(&self.in_flight);
-        // The map's copy and ours: nobody else is waiting on this slot.
-        if in_flight
-            .get(&hash)
-            .is_some_and(|s| Arc::strong_count(s) <= 2)
-        {
-            in_flight.remove(&hash);
-        }
-        out
+        let entry = InFlightEntry::join(&self.in_flight, hash);
+        // Wait our turn, but not for long. Giving up drops our place in the
+        // queue (passing any wake-up on), so a stalled download holds up
+        // nobody for more than IN_FLIGHT_WAIT.
+        let _turn = if let Some(guard) = entry.slot().try_lock() {
+            Some(guard)
+        } else if !crate::time::has_timer() {
+            // No clock to bound the wait by (the demo, driven by hand,
+            // where nothing stalls): wait.
+            Some(entry.slot().lock().await)
+        } else {
+            let turn = std::pin::pin!(entry.slot().lock());
+            let timer = std::pin::pin!(crate::time::sleep(IN_FLIGHT_WAIT));
+            match futures::future::select(turn, timer).await {
+                futures::future::Either::Left((guard, _)) => Some(guard),
+                // Someone else's download is taking too long: we get our
+                // own copy (one download, checked and blamed the same way).
+                futures::future::Either::Right(_) => None,
+            }
+        };
+        self.fetch_block_once(i, hash).await
+        // `_turn`, then `entry`, are dropped here, in that order.
+    }
+
+    /// How many block hashes have a download slot right now. For tests:
+    /// it must fall back to zero once no download is running.
+    #[doc(hidden)]
+    pub fn in_flight_len(&self) -> usize {
+        lock(&self.in_flight).len()
     }
 
     async fn fetch_block_once(&self, i: usize, hash: BlockHash) -> Fetched {
@@ -1139,11 +1395,6 @@ impl Node {
             Err(e) => {
                 let why = format!("block {hash}: {e}");
                 warn!(%hash, error = %e, "refusing a block we can't judge; no source blamed");
-                self.set_alarm(
-                    "signet-unjudged",
-                    AlarmLevel::Warning,
-                    format!("not following or serving {why}; no source is blamed, since Bitcoin Core may accept it"),
-                );
                 let mut unjudged = lock(&self.unjudged);
                 if unjudged.len() >= UNJUDGED_MAX {
                     unjudged.clear();
@@ -1336,6 +1587,11 @@ impl Node {
             match self.fetch_block_from(i, hash).await {
                 Fetched::Verified(raw) => return Ok(raw),
                 Fetched::Unjudged(why) => {
+                    self.set_alarm(
+                        "signet-unjudged-getblock",
+                        AlarmLevel::Warning,
+                        format!("refused to serve {why} (shown until the next new block); no source is blamed, since Bitcoin Core may accept it"),
+                    );
                     return Err(RpcError::new(
                         RPC_MISC_ERROR,
                         format!("Block refused (no source blamed): {why}"),

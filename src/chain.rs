@@ -21,12 +21,44 @@ pub const MAX_FUTURE_SECS: u64 = 2 * 60 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
     UnknownParent(BlockHash),
-    BadLink { height: u32 },
-    BadPow { hash: BlockHash },
-    TargetAboveLimit { hash: BlockHash },
-    BadDifficulty { hash: BlockHash, height: u32 },
-    TimeTooNew { hash: BlockHash },
-    TimeTooOld { hash: BlockHash },
+    BadLink {
+        height: u32,
+    },
+    BadPow {
+        hash: BlockHash,
+    },
+    /// `bits` that Bitcoin Core's `SetCompact` calls negative, zero or
+    /// overflowing: no header with them is valid.
+    BadBits {
+        hash: BlockHash,
+    },
+    TargetAboveLimit {
+        hash: BlockHash,
+    },
+    BadDifficulty {
+        hash: BlockHash,
+        height: u32,
+    },
+    /// The retarget at height `at` needs the header at `height` (its
+    /// period's first), which is below our checkpoint and not known yet.
+    /// Nobody is at fault; see [`HeaderChain::add_period_start`].
+    NeedPeriodStart {
+        height: u32,
+        at: u32,
+    },
+    /// The retarget's `bits` differ from what the period's first header
+    /// gives, but that header was only cross-checked between sources, not
+    /// proven to be on our chain, so we can't say who is wrong.
+    UnprovenRetarget {
+        hash: BlockHash,
+        height: u32,
+    },
+    TimeTooNew {
+        hash: BlockHash,
+    },
+    TimeTooOld {
+        hash: BlockHash,
+    },
 }
 
 impl fmt::Display for ChainError {
@@ -35,6 +67,18 @@ impl fmt::Display for ChainError {
             ChainError::UnknownParent(h) => write!(f, "header's parent {h} is not in our chain"),
             ChainError::BadLink { height } => write!(f, "headers don't link at height {height}"),
             ChainError::BadPow { hash } => write!(f, "header {hash} fails its proof of work"),
+            ChainError::BadBits { hash } => write!(
+                f,
+                "header {hash} has bits that don't decode to a valid target (negative, zero or overflowing)"
+            ),
+            ChainError::NeedPeriodStart { height, at } => write!(
+                f,
+                "the retarget at height {at} needs the header at height {height}, below our checkpoint, which we don't have yet"
+            ),
+            ChainError::UnprovenRetarget { hash, height } => write!(
+                f,
+                "header {hash} at height {height} doesn't carry the bits the period's first header gives (that header is cross-checked, not proven)"
+            ),
             ChainError::TargetAboveLimit { hash } => {
                 write!(
                     f,
@@ -88,6 +132,9 @@ pub struct HeaderChain {
     best: Vec<BlockHash>,
     /// The best chain before the last switch, to measure reorg depth.
     old_best: Vec<BlockHash>,
+    /// The first header of the checkpoint's retarget period when that's
+    /// below the checkpoint, by height (see [`HeaderChain::add_period_start`]).
+    period_starts: HashMap<u32, Header>,
 }
 
 impl HeaderChain {
@@ -121,6 +168,7 @@ impl HeaderChain {
             entries,
             best: vec![base_hash],
             old_best: Vec::new(),
+            period_starts: HashMap::new(),
         }
     }
 
@@ -217,6 +265,39 @@ impl HeaderChain {
         times.get(times.len() / 2).copied().unwrap_or(0)
     }
 
+    /// Give the chain the first header of the checkpoint's retarget period
+    /// when that is below the checkpoint, so the next retarget can be
+    /// checked exactly (see [`ChainError::NeedPeriodStart`]). The node gets
+    /// it from two agreeing sources, so it is checked as far as it can be
+    /// here: it must be at that period's start, meet its own proof of work
+    /// within the network's limit, and carry the checkpoint's `bits` (one
+    /// period has one difficulty on a network without minimum-difficulty
+    /// blocks). It is kept for as long as the chain lives.
+    pub fn add_period_start(&mut self, height: u32, header: Header) -> Result<(), String> {
+        let interval = self.params.difficulty_adjustment_interval() as u32;
+        if self.params.no_pow_retargeting || !height.is_multiple_of(interval) {
+            return Err(format!("height {height} doesn't start a retarget period"));
+        }
+        if height >= self.base_height || height + interval <= self.base_height {
+            return Err(format!(
+                "height {height} doesn't start our checkpoint's retarget period"
+            ));
+        }
+        let base_bits = self.entries[&self.base_hash].header.bits;
+        if header.bits != base_bits {
+            return Err(format!(
+                "the header at {height} has other bits than our checkpoint"
+            ));
+        }
+        let ok_pow = derive_target(header.bits, &self.params)
+            .is_some_and(|t| header.validate_pow(t).is_ok());
+        if !ok_pow {
+            return Err(format!("the header at {height} fails its proof of work"));
+        }
+        self.period_starts.insert(height, header);
+        Ok(())
+    }
+
     /// Check a run of headers (oldest first) whose first header's parent we
     /// already know, add them, and switch to them if they carry more work.
     /// Nothing is added unless every header passes.
@@ -269,13 +350,15 @@ impl HeaderChain {
                 return Err(ChainError::BadLink { height });
             }
             let hash = h.block_hash();
-            let target = h.target();
+            let target = decode_compact(h.bits).ok_or(ChainError::BadBits { hash })?;
             if target > self.params.max_attainable_target {
                 return Err(ChainError::TargetAboveLimit { hash });
             }
+            // The difficulty before the proof of work: both are cheap, and
+            // this way a header with the wrong bits is refused for that.
+            self.check_difficulty(&prev, h, height, &checked)?;
             h.validate_pow(target)
                 .map_err(|_| ChainError::BadPow { hash })?;
-            self.check_difficulty(&prev, h, height, &checked)?;
             if u64::from(h.time) > now + MAX_FUTURE_SECS {
                 return Err(ChainError::TimeTooNew { hash });
             }
@@ -331,13 +414,12 @@ impl HeaderChain {
     /// must be exactly what `CalculateNextWorkRequired` gives from the
     /// period's first and last headers.
     ///
-    /// Just above a checkpoint the period's first header can be below it,
-    /// and so unknown. Then we apply Core's own bound for that case
-    /// (`PermittedDifficultyTransition`, used while it syncs headers): the
-    /// new target within 4x of the old one either way, both limits rounded
-    /// through the compact form as Core rounds them. That is looser than
-    /// exact (a slightly harder target passes), but harder only means more
-    /// work, and on signet every block still needs the signer's signature.
+    /// Just above a checkpoint the period's first header can be below it.
+    /// Then it must have been given with [`HeaderChain::add_period_start`];
+    /// until it is, the retarget header isn't accepted
+    /// ([`ChainError::NeedPeriodStart`]). A looser range (Core's
+    /// `PermittedDifficultyTransition`) would let a slightly harder target
+    /// through, so there is no fallback.
     fn check_difficulty(
         &self,
         prev: &Entry,
@@ -362,16 +444,26 @@ impl HeaderChain {
             match self.parent_of(&first, batch) {
                 Some(p) => first = p,
                 None => {
-                    return if permitted_difficulty_transition(
-                        &self.params,
-                        height,
-                        prev.header.bits,
-                        h.bits,
-                    ) {
-                        Ok(())
-                    } else {
-                        Err(bad())
+                    let start = height - interval;
+                    let Some(anchor) = self.period_starts.get(&start) else {
+                        return Err(ChainError::NeedPeriodStart {
+                            height: start,
+                            at: height,
+                        });
                     };
+                    let expected = next_work_required(
+                        prev.header.bits,
+                        anchor.time,
+                        prev.header.time,
+                        &self.params,
+                    );
+                    if h.bits != expected {
+                        return Err(ChainError::UnprovenRetarget {
+                            hash: h.block_hash(),
+                            height,
+                        });
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -431,25 +523,33 @@ pub fn next_work_required(
     retarget(prev_bits, actual as u64, params)
 }
 
-/// Bitcoin Core's `PermittedDifficultyTransition` (src/pow.cpp), for a
-/// network without minimum-difficulty blocks: at a retarget height, the
-/// new target must lie between the targets four times faster and four
-/// times slower would give, each rounded through the compact form; at any
-/// other height `bits` must not change.
-pub fn permitted_difficulty_transition(
-    params: &Params,
-    height: u32,
-    old_bits: CompactTarget,
-    new_bits: CompactTarget,
-) -> bool {
-    let interval = params.difficulty_adjustment_interval() as u32;
-    if !height.is_multiple_of(interval) {
-        return old_bits == new_bits;
+/// Bitcoin Core's `SetCompact`: the target `bits` encode, or `None` when
+/// Core reports it negative or overflowing, or it is zero. Bitcoin Core
+/// refuses every such header (`DeriveTarget`). rust-bitcoin's
+/// `Target::from_compact` wraps an overflowing shift instead (0x3d14fcee
+/// decodes to 0x1d14fcee's target), so every consensus decode goes
+/// through here.
+pub fn decode_compact(bits: CompactTarget) -> Option<Target> {
+    let c = bits.to_consensus();
+    let size = c >> 24;
+    let mut word = c & 0x007f_ffff;
+    if size <= 3 {
+        word >>= 8 * (3 - size);
     }
-    let observed = Target::from_compact(new_bits);
-    let largest = retarget(old_bits, params.pow_target_timespan * 4, params);
-    let smallest = retarget(old_bits, params.pow_target_timespan / 4, params);
-    observed <= Target::from_compact(largest) && observed >= Target::from_compact(smallest)
+    let negative = word != 0 && c & 0x0080_0000 != 0;
+    let overflow =
+        word != 0 && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+    if negative || overflow || word == 0 {
+        return None;
+    }
+    // Neither negative nor overflowing: rust-bitcoin decodes it exactly.
+    Some(Target::from_compact(bits))
+}
+
+/// Bitcoin Core's `DeriveTarget`: [`decode_compact`], and no easier than
+/// the network allows.
+pub fn derive_target(bits: CompactTarget, params: &Params) -> Option<Target> {
+    decode_compact(bits).filter(|t| *t <= params.max_attainable_target)
 }
 
 /// `bnNew = old target * actual / timespan`, capped at the limit, as compact.

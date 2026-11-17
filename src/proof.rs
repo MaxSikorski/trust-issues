@@ -20,6 +20,9 @@ pub enum ProofError {
     /// pads with a copy, so it matches the header's merkle root without
     /// being the block (CVE-2012-2459; Core's "mutated" merkle tree).
     DuplicateTransactions,
+    /// The first transaction isn't a coinbase, or a later one is (Core's
+    /// `CheckBlock`: "first tx is not coinbase", "more than one coinbase").
+    BadCoinbase,
     /// The witness data doesn't match the coinbase's witness commitment,
     /// or is there without one, or the commitment's reserved value is
     /// missing (Core's `CheckWitnessMalleation`). Stripping a block's
@@ -55,6 +58,7 @@ impl std::fmt::Display for ProofError {
             ProofError::DuplicateTransactions => {
                 "block's transaction list is padded with a duplicate (a mutated merkle tree)"
             }
+            ProofError::BadCoinbase => "block's first transaction isn't its one coinbase",
             ProofError::BadWitnessCommitment => "block's witness data doesn't match its commitment",
             ProofError::SuspiciousSize => "64-byte transaction refused",
             ProofError::BadMerkleProof => "merkle proof doesn't lead to the block's merkle root",
@@ -68,8 +72,9 @@ impl std::fmt::Display for ProofError {
 
 /// Decode a raw block and check it is exactly the block `expected` names,
 /// as Bitcoin Core's `CheckBlock` would before trusting a body: same hash,
-/// transactions matching the merkle root with no duplicate padding, and
-/// witness data matching the coinbase's witness commitment. Anything that
+/// transactions matching the merkle root with no duplicate padding, a
+/// coinbase first and nowhere else, and witness data matching the
+/// coinbase's witness commitment. Anything that
 /// passes is byte-for-byte the block (no other body has this header).
 pub fn verify_block(raw: &[u8], expected: BlockHash) -> Result<Block, ProofError> {
     let block: Block = deserialize(raw).map_err(|_| ProofError::Undecodable)?;
@@ -89,6 +94,13 @@ pub fn verify_block(raw: &[u8], expected: BlockHash) -> Result<Block, ProofError
     }
     if mutated {
         return Err(ProofError::DuplicateTransactions);
+    }
+    // The witness check below takes the first transaction as the coinbase
+    // (its witness is the reserved value, its wtxid counts as zero), so it
+    // must be one, and the only one, on every network.
+    let first_is_coinbase = block.txdata.first().is_some_and(Transaction::is_coinbase);
+    if !first_is_coinbase || block.txdata[1..].iter().any(Transaction::is_coinbase) {
+        return Err(ProofError::BadCoinbase);
     }
     check_witness_malleation(&block)?;
     Ok(block)
@@ -227,4 +239,18 @@ pub fn verify_merkle_branch(
     } else {
         Err(ProofError::BadMerkleProof)
     }
+}
+
+/// BIP34, as Bitcoin Core checks it (`ContextualCheckBlock`): the
+/// coinbase's scriptSig starts with the block's height, pushed the way
+/// `CScript() << height` pushes it. Active from the start on signet.
+pub fn coinbase_height_is(block: &Block, height: u32) -> bool {
+    let expected = bitcoin::script::Builder::new()
+        .push_int(i64::from(height))
+        .into_script();
+    block
+        .txdata
+        .first()
+        .and_then(|cb| cb.input.first())
+        .is_some_and(|i| i.script_sig.as_bytes().starts_with(expected.as_bytes()))
 }

@@ -176,6 +176,11 @@ pub struct FakeState {
     /// `raw_block` answers "not found" for these (withholding a block
     /// while showing its header).
     pub withheld_blocks: HashSet<BlockHash>,
+    /// `blocks[i]` is at height `height_offset + i` for `tip_height` and
+    /// `block_hash_at` (real signet blocks sit at real heights).
+    pub height_offset: u32,
+    /// `block_hash_at` answers these first (a header far below the rest).
+    pub at_height: HashMap<u32, BlockHash>,
 }
 
 pub struct FakeSource {
@@ -254,7 +259,7 @@ impl Source for FakeSource {
 
     async fn tip_height(&self) -> Result<u32, SourceError> {
         let s = self.guard()?;
-        Ok(Self::visible_blocks(&s).len() as u32 - 1)
+        Ok(s.height_offset + Self::visible_blocks(&s).len() as u32 - 1)
     }
 
     async fn block_hash_at(&self, height: u32) -> Result<BlockHash, SourceError> {
@@ -264,8 +269,14 @@ impl Source for FakeSource {
         {
             return Ok(g);
         }
+        if let Some(h) = s.at_height.get(&height) {
+            return Ok(*h);
+        }
+        let Some(i) = height.checked_sub(s.height_offset) else {
+            return Err(SourceError::NotFound);
+        };
         Self::visible_blocks(&s)
-            .get(height as usize)
+            .get(i as usize)
             .map(|b| b.block_hash())
             .ok_or(SourceError::NotFound)
     }

@@ -256,6 +256,10 @@ fn mine_bits(prev: &bitcoin::block::Header, time: u32, bits: u32) -> bitcoin::bl
 fn first_period(bits: u32, step: u32) -> (bitcoin::block::Header, Vec<bitcoin::block::Header>) {
     let mut base = genesis().header;
     base.bits = CompactTarget::from_consensus(bits);
+    // Mined too: it may be given as a period's first header.
+    while base.validate_pow(base.target()).is_err() {
+        base.nonce += 1;
+    }
     let mut hs: Vec<bitcoin::block::Header> = Vec::new();
     let mut prev = base;
     for _ in 0..3 {
@@ -314,23 +318,23 @@ fn an_honest_four_times_harder_retarget_survives_compact_rounding() {
     chain.connect(&[h], now).unwrap();
     assert_eq!(chain.tip_height(), 4);
 
-    // Starting from a checkpoint inside the period, the first header of the
-    // period is unknown, so only Core's permitted range applies (also with
-    // the rounding): the same header is accepted, a harder one is not.
+    // Starting from a checkpoint inside the period, with the period's
+    // first header given separately (as the node does): the same header is
+    // accepted, one unit harder is not.
     let mut chain = HeaderChain::with_params(p, 3, last);
-    chain.connect(&[h], now).unwrap();
-    assert_eq!(chain.tip_height(), 4);
-    let chain = HeaderChain::with_params(short_signet_params(), 3, last);
+    chain.add_period_start(0, base).unwrap();
     let too_hard = mine_bits(&last, last.time + 1, 0x2005_3f3a);
     assert!(matches!(
         chain.check(&[too_hard], now).unwrap_err(),
-        ChainError::BadDifficulty { height: 4, .. }
+        ChainError::UnprovenRetarget { height: 4, .. }
     ));
+    chain.connect(&[h], now).unwrap();
+    assert_eq!(chain.tip_height(), 4);
 }
 
 #[test]
 fn the_retarget_matches_real_signet_and_cores_rounding() {
-    use trust_issues::chain::{next_work_required, permitted_difficulty_transition};
+    use trust_issues::chain::next_work_required;
     let p = bitcoin::params::Params::new(Network::Signet);
     let bits = CompactTarget::from_consensus;
     // Real signet, read from a local node: the period 328608..330623 took
@@ -360,26 +364,148 @@ fn the_retarget_matches_real_signet_and_cores_rounding() {
         next_work_required(bits(0x1e03_77ae), 0, 10 * 1_209_600, &p),
         bits(0x1e03_77ae)
     );
-    // Core's bound when the period's start is unknown, at 330624.
-    for (new, ok) in [
-        (0x1d14_fcee, true),
-        (0x1d05_3335, false),
-        (0x1d05_3361, true),
-        (0x1d14_fced, true),
-        (0x1d53_3614, true),
-        (0x1d53_3615, false),
-        (0x1e03_77ae, false),
-    ] {
-        assert_eq!(
-            permitted_difficulty_transition(&p, 330_624, bits(0x1d14_cd85), bits(new)),
-            ok,
-            "{new:x}"
-        );
-    }
-    assert!(!permitted_difficulty_transition(
-        &p,
-        330_625,
-        bits(0x1d14_fcee),
-        bits(0x1d14_fced)
+}
+
+// ---------- second review (2026-11-17) ----------
+
+#[test]
+fn a_retarget_just_above_a_checkpoint_needs_the_periods_first_header() {
+    // A checkpoint at height 3 (inside the first 4-block period): the
+    // period's first header (height 0) is below it, so the exact retarget
+    // can't be computed from the chain alone.
+    let p = short_signet_params();
+    let (base, hs) = first_period(0x1f7f_ffff, 400);
+    let last = *hs.last().unwrap();
+    let now = u64::from(last.time) + 10_000;
+    let expected = 0x1f3f_ffff;
+    let mut chain = HeaderChain::with_params(p, 3, last);
+
+    // One unit harder than Core computes: inside Core's permitted range,
+    // which is all 5f78d99 checked here, so it was accepted.
+    let harder = mine_bits(&last, last.time + 400, expected - 1);
+    let err = chain.check(&[harder], now).unwrap_err();
+    assert_eq!(err, ChainError::NeedPeriodStart { height: 0, at: 4 });
+    // So is the exact header: without the first header nothing passes.
+    let exact = mine_bits(&last, last.time + 400, expected);
+    assert_eq!(
+        chain.check(&[exact], now).unwrap_err(),
+        ChainError::NeedPeriodStart { height: 0, at: 4 }
+    );
+
+    // A wrong first header is refused: not at a period start, not in the
+    // checkpoint's period, or with other bits.
+    assert!(chain.add_period_start(1, hs[0]).is_err());
+    let mut other_bits = base;
+    other_bits.bits = CompactTarget::from_consensus(REGTEST_BITS);
+    assert!(chain.add_period_start(0, other_bits).is_err());
+    let mut far = HeaderChain::with_params(short_signet_params(), 7, last);
+    assert!(far.add_period_start(0, base).is_err());
+
+    // With the real first header the retarget is exact.
+    chain.add_period_start(0, base).unwrap();
+    assert!(matches!(
+        chain.check(&[harder], now).unwrap_err(),
+        ChainError::UnprovenRetarget { height: 4, .. }
     ));
+    chain.connect(&[exact], now).unwrap();
+    assert_eq!(chain.tip_height(), 4);
+}
+
+#[test]
+fn bits_that_overflow_or_go_negative_are_refused_like_core() {
+    use trust_issues::chain::decode_compact;
+    let bits = CompactTarget::from_consensus;
+    // rust-bitcoin wraps the shift: 0x3f3fffff decodes to 0x1f3fffff's
+    // target. Bitcoin Core's SetCompact reports an overflow.
+    assert_eq!(
+        bitcoin::Target::from_compact(bits(0x3f3f_ffff)),
+        bitcoin::Target::from_compact(bits(0x1f3f_ffff))
+    );
+    for (b, ok) in [
+        (0x1d14_fcee, true),
+        (0x3d14_fcee, false),
+        (0x2200_00ff, true),
+        (0x2200_0100, false),
+        (0x2100_ffff, true),
+        (0x2101_0000, false),
+        (0x2300_0001, false),
+        (0x0480_0001, false),
+        (0x0400_0000, false),
+        (0x0000_0000, false),
+        (0x0100_3456, false),
+        (0x0112_3456, true),
+        (0x0180_0000, false),
+    ] {
+        assert_eq!(decode_compact(bits(b)).is_some(), ok, "{b:08x}");
+    }
+    assert_eq!(
+        decode_compact(bits(0x0112_3456)),
+        Some(bitcoin::Target::from_be_bytes({
+            let mut t = [0u8; 32];
+            t[31] = 0x12;
+            t
+        }))
+    );
+
+    // In the chain: at the retarget above a checkpoint, the overflowing
+    // form of the expected bits met its (wrapped) target and fell inside
+    // Core's permitted range, so 5f78d99 accepted it.
+    let (_, hs) = first_period(0x1f7f_ffff, 400);
+    let last = *hs.last().unwrap();
+    let now = u64::from(last.time) + 10_000;
+    let chain = HeaderChain::with_params(short_signet_params(), 3, last);
+    let overflow = mine_bits(&last, last.time + 400, 0x3f3f_ffff);
+    assert!(overflow.validate_pow(overflow.target()).is_ok());
+    assert!(matches!(
+        chain.check(&[overflow], now).unwrap_err(),
+        ChainError::BadBits { .. }
+    ));
+}
+
+fn real_header(hex: &str) -> bitcoin::block::Header {
+    use bitcoin::hex::FromHex;
+    bitcoin::consensus::encode::deserialize(&Vec::<u8>::from_hex(hex.trim()).unwrap()).unwrap()
+}
+
+#[test]
+fn the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period() {
+    use bitcoin::hex::FromHex;
+    let h623 = real_header(include_str!("fixtures/signet-330623-header.hex"));
+    let h608 = real_header(include_str!("fixtures/signet-328608-header.hex"));
+    let b624: bitcoin::Block = bitcoin::consensus::encode::deserialize(
+        &Vec::<u8>::from_hex(include_str!("fixtures/signet-330624-block.hex").trim()).unwrap(),
+    )
+    .unwrap();
+    let h624 = b624.header;
+    assert_eq!(h624.bits, CompactTarget::from_consensus(0x1d14_fcee));
+    let now = u64::from(h624.time) + 60;
+    let mut chain = HeaderChain::new(Network::Signet, 330_623, h623);
+    assert_eq!(
+        chain.check(&[h624], now).unwrap_err(),
+        ChainError::NeedPeriodStart {
+            height: 328_608,
+            at: 330_624
+        }
+    );
+    chain.add_period_start(328_608, h608).unwrap();
+    // One unit harder: Core's permitted range allows it (5f78d99 did), the
+    // exact rule doesn't. The bits are checked before the proof of work,
+    // so an unmined header shows which rule refuses it.
+    let mut harder = h624;
+    harder.bits = CompactTarget::from_consensus(0x1d14_fced);
+    assert!(matches!(
+        chain.check(&[harder], now).unwrap_err(),
+        ChainError::UnprovenRetarget {
+            height: 330_624,
+            ..
+        }
+    ));
+    let mut overflow = h624;
+    overflow.bits = CompactTarget::from_consensus(0x3d14_fcee);
+    assert!(matches!(
+        chain.check(&[overflow], now).unwrap_err(),
+        ChainError::BadBits { .. }
+    ));
+    chain.connect(&[h624], now).unwrap();
+    assert_eq!(chain.tip_hash(), h624.block_hash());
 }

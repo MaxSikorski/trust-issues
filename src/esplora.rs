@@ -31,6 +31,9 @@ pub struct EsploraSource {
     /// Session tag that keeps this source on its own circuit.
     session: String,
     broadcasts: AtomicU64,
+    /// Body bytes taken from this source's answers so far (a test checks
+    /// that an oversized answer stops being read near the limit).
+    body_bytes: AtomicU64,
 }
 
 fn build_client(route: &Route, isolation: &str) -> Result<reqwest::Client, String> {
@@ -78,6 +81,7 @@ impl EsploraSource {
             client: build_client(&spec.route, &session)?,
             session,
             broadcasts: AtomicU64::new(0),
+            body_bytes: AtomicU64::new(0),
         })
     }
 
@@ -88,7 +92,9 @@ impl EsploraSource {
             .send()
             .await
             .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?;
-        read_body(resp).await
+        let (result, taken) = read_body_counted(resp).await;
+        self.body_bytes.fetch_add(taken as u64, Ordering::Relaxed);
+        result
     }
 
     async fn get_text(&self, path: &str) -> Result<String, SourceError> {
@@ -104,7 +110,18 @@ impl EsploraSource {
     }
 }
 
-async fn read_body(mut resp: reqwest::Response) -> Result<Vec<u8>, SourceError> {
+/// Read an answer's body (at most `MAX_BODY`), and say how many body bytes
+/// it took from the connection.
+async fn read_body_counted(mut resp: reqwest::Response) -> (Result<Vec<u8>, SourceError>, usize) {
+    let mut taken = 0;
+    let result = read_body_into(&mut resp, &mut taken).await;
+    (result, taken)
+}
+
+async fn read_body_into(
+    resp: &mut reqwest::Response,
+    taken: &mut usize,
+) -> Result<Vec<u8>, SourceError> {
     let status = resp.status().as_u16();
     let retry_after = resp
         .headers()
@@ -127,6 +144,7 @@ async fn read_body(mut resp: reqwest::Response) -> Result<Vec<u8>, SourceError> 
         .await
         .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?
     {
+        *taken += chunk.len();
         if body.len() + chunk.len() > MAX_BODY {
             return Err(SourceError::Invalid("answer too large".into()));
         }
@@ -222,10 +240,15 @@ mod tests {
         })
         .unwrap();
         let res = source.raw_block(BlockHash::all_zeros()).await;
+        let taken = source.body_bytes.load(Ordering::Relaxed) as usize;
         assert!(
             matches!(&res, Err(SourceError::Invalid(m)) if m.contains("too large")),
             "{res:?}"
         );
+        // It stops at the first piece that crosses 8 MiB: at most one
+        // 64 KiB chunk (the server's chunk size) past the limit.
+        assert!(taken > MAX_BODY, "took {taken} bytes");
+        assert!(taken <= MAX_BODY + 64 * 1024, "took {taken} bytes");
         drop(source);
         // Joined off the runtime, so the client can finish hanging up.
         let sent = tokio::task::spawn_blocking(move || server.join().unwrap())
@@ -376,7 +399,7 @@ impl Source for EsploraSource {
             .send()
             .await
             .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?;
-        let bytes = read_body(resp).await?;
+        let bytes = read_body_counted(resp).await.0?;
         let text = String::from_utf8_lossy(&bytes);
         parse(&text, "txid")
     }

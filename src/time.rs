@@ -10,6 +10,19 @@
 #[cfg(feature = "server")]
 pub use tokio::time::{Instant, sleep};
 
+/// True when `sleep` really waits: inside a tokio runtime. The demo drives
+/// the node with a plain executor and no timer, so it must not start one.
+#[cfg(feature = "server")]
+pub fn has_timer() -> bool {
+    tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// The frozen clock never waits, so there is nothing to bound a wait by.
+#[cfg(not(feature = "server"))]
+pub fn has_timer() -> bool {
+    false
+}
+
 #[cfg(not(feature = "server"))]
 pub use frozen::{Instant, sleep};
 

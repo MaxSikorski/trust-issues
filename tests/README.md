@@ -47,7 +47,7 @@ Two examples are not tests:
 | token_bucket_allows_a_burst_then_the_rate | Burst then rate; asking for more than 2/s is clamped |
 | backoff_doubles_from_five_seconds_to_a_ten_minute_cap | 5, 10, 20 … 600 s, plus jitter |
 
-## config_rules.rs: safety rails (5)
+## config_rules.rs: safety rails (10)
 | Test | Checks |
 |---|---|
 | only_signet_and_regtest_are_allowed | Mainnet, testnet and testnet4 are refused |
@@ -55,17 +55,33 @@ Two examples are not tests:
 | default_signet_config_uses_three_independent_onions_through_tor | The defaults are three onions (mempool.space, Emzy, Blockstream), all via Tor |
 | needs_two_sources_and_respects_the_request_ceiling | At least two sources; no more than 2 requests/s; unknown keys refused |
 | checkpoint_parses_height_and_hash | `height:hash` format |
+| two_sources_on_one_host_and_port_are_one_source_in_the_file_too | Two sources on the same host and port (any path, slash, case, default port) are refused, from the file and from the list |
+| syntax_errors_report_only_the_position | A broken config file is reported as line and column, never its text |
+| source_urls_with_a_login_are_refused_and_never_echoed | `user:password@` in a source URL is refused and never shown in an error |
+| numbers_in_the_file_must_be_finite_and_above_the_floor | `inf`, `nan` and a request rate under 0.01/s are refused |
+| blank_string_overrides_are_refused_by_name | A blank override is an error naming the setting; `tor_socks` must be `host:port` |
 
-## config_env.rs: settings from flags and environment variables (7)
+## config_env.rs: settings from flags and environment variables (18)
 | Test | Checks |
 |---|---|
 | environment_variables_alone_are_enough | No file needed: network, Tor, bind and data dir from the environment, default onion sources |
 | flags_beat_environment_variables_which_beat_the_file | Precedence: flag, then environment variable, then file |
 | neither_a_flag_nor_an_environment_variable_can_pick_mainnet | Mainnet and testnets are refused from both routes |
-| sources_from_the_environment_follow_the_same_rules | Clearnet, a single source and malformed lists are refused; onion plus a home machine is routed correctly |
-| the_network_must_be_set_somewhere | No network anywhere is an error |
-| passwords_never_come_from_flags_or_the_environment | `--rpc-user`/`--rpc-password` don't exist, the env var is ignored, the password is never printed |
+| sources_from_the_environment_follow_the_same_rules | Clearnet, a single source and malformed entries (each next to two good ones) are refused; onion plus a home machine is routed correctly |
+| the_network_must_be_set_somewhere | No network anywhere is an error ("network must be set") |
+| passwords_never_come_from_flags_or_the_environment | `--rpc-user`/`--rpc-password` are clap's unexpected arguments, the env var is ignored, `rpc_auth` never names the user or shows the password |
 | the_old_command_lines_still_work | `health-check --config F [--synced]` still works |
+| health_check_synced_follows_what_the_server_says | Against a loopback `/health`: not synced means `--synced` exits 1, plain exits 0; synced means both exit 0 |
+| the_bare_old_form_works_with_the_flag_on_either_side | `--config F check-config` and `check-config --config F` |
+| a_repeated_config_flag_is_refused_and_a_dash_name_is_allowed | Two `--config` flags are refused; a file named `-dash.toml` works |
+| syntax_errors_never_echo_the_file | An unterminated password, a cookie file and a wrong type never appear in the error |
+| check_config_names_no_user_and_sources_carry_no_login | `rpc_auth` line without the user name; logins in source URLs refused; `--help` shows no environment values |
+| numbers_must_be_finite_and_requests_must_reach_the_limiters_floor | `1e309`, `inf`, `nan`, rates under 0.01 or over 2 refused, with the setting named |
+| a_blank_value_never_overrides_the_file_and_tor_must_be_host_and_port | Empty or blank values for every setting are errors; bad `tor_socks` refused; stray whitespace trimmed |
+| only_the_winning_number_is_parsed | A bad environment number doesn't break a flag that beats it |
+| spaces_inside_a_sources_entry_are_refused | Whitespace in a name or URL is an error, not folded into the URL |
+| duplicate_sources_are_refused_from_flags_and_the_environment | The same host and port twice is refused; another port is fine |
+| a_password_in_the_environment_is_ignored_loudly_and_never_echoed | Warning on stderr naming the variable, never its value |
 
 ## adversarial.rs: lying, hiding and failing sources (16)
 | Test | Checks |
@@ -112,4 +128,4 @@ Two examples are not tests:
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 74 tests.**
+**Total: 90 tests.**

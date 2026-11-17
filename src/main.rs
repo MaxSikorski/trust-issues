@@ -28,31 +28,82 @@ use trust_issues::systemd;
 )]
 struct Cli {
     /// Optional config file (TOML)
-    #[arg(long, global = true, env = "TRUST_ISSUES_CONFIG")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_CONFIG",
+        hide_env_values = true,
+        allow_hyphen_values = true
+    )]
     config: Option<PathBuf>,
     /// signet (or regtest for tests)
-    #[arg(long, global = true, env = "TRUST_ISSUES_NETWORK")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_NETWORK",
+        hide_env_values = true
+    )]
     network: Option<String>,
     /// Address of Tor's SOCKS port, like 127.0.0.1:9050
-    #[arg(long, global = true, env = "TRUST_ISSUES_TOR_SOCKS")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_TOR_SOCKS",
+        hide_env_values = true
+    )]
     tor_socks: Option<String>,
     /// Where the RPC listens, like 127.0.0.1:38332
-    #[arg(long, global = true, env = "TRUST_ISSUES_RPC_BIND")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_RPC_BIND",
+        hide_env_values = true
+    )]
     rpc_bind: Option<String>,
     /// Where the cookie file goes
-    #[arg(long, global = true, env = "TRUST_ISSUES_DATA_DIR")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_DATA_DIR",
+        hide_env_values = true
+    )]
     data_dir: Option<PathBuf>,
-    #[arg(long, global = true, env = "TRUST_ISSUES_POLL_INTERVAL_SECS")]
-    poll_interval_secs: Option<u64>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_POLL_INTERVAL_SECS",
+        hide_env_values = true
+    )]
+    poll_interval_secs: Option<String>,
     /// "<height>:<block hash>"
-    #[arg(long, global = true, env = "TRUST_ISSUES_CHECKPOINT")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_CHECKPOINT",
+        hide_env_values = true
+    )]
     checkpoint: Option<String>,
-    #[arg(long, global = true, env = "TRUST_ISSUES_REQUESTS_PER_SEC")]
-    requests_per_sec: Option<f64>,
-    #[arg(long, global = true, env = "TRUST_ISSUES_FEE_CEILING_SAT_VB")]
-    fee_ceiling_sat_vb: Option<f64>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_REQUESTS_PER_SEC",
+        hide_env_values = true
+    )]
+    requests_per_sec: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_FEE_CEILING_SAT_VB",
+        hide_env_values = true
+    )]
+    fee_ceiling_sat_vb: Option<String>,
     /// name=url,name=url (replaces the file's sources)
-    #[arg(long, global = true, env = "TRUST_ISSUES_SOURCES")]
+    #[arg(
+        long,
+        global = true,
+        env = "TRUST_ISSUES_SOURCES",
+        hide_env_values = true
+    )]
     sources: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -71,6 +122,14 @@ enum Command {
 }
 
 fn load(cli: &Cli) -> Result<Config> {
+    // clap keeps only the last of a repeated global flag, so count them here.
+    let given = std::env::args_os()
+        .skip(1)
+        .filter(|a| a == "--config" || a.to_string_lossy().starts_with("--config="))
+        .count();
+    if given > 1 {
+        bail!("--config was given more than once; pass one config file");
+    }
     let text = match &cli.config {
         Some(p) => {
             Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
@@ -82,10 +141,10 @@ fn load(cli: &Cli) -> Result<Config> {
         tor_socks: cli.tor_socks.clone(),
         rpc_bind: cli.rpc_bind.clone(),
         data_dir: cli.data_dir.clone(),
-        poll_interval_secs: cli.poll_interval_secs,
+        poll_interval_secs: cli.poll_interval_secs.clone(),
         checkpoint: cli.checkpoint.clone(),
-        requests_per_sec: cli.requests_per_sec,
-        fee_ceiling_sat_vb: cli.fee_ceiling_sat_vb,
+        requests_per_sec: cli.requests_per_sec.clone(),
+        fee_ceiling_sat_vb: cli.fee_ceiling_sat_vb.clone(),
         sources: cli.sources.clone(),
     };
     load_config(text.as_deref(), &o).map_err(|e| anyhow::anyhow!("{e}"))
@@ -103,19 +162,33 @@ fn print_config(cfg: &Config) {
     }
     println!("requests_per_sec: {}", cfg.requests_per_sec);
     println!("fee_ceiling_sat_vb: {}", cfg.fee_ceiling_sat_vb);
-    if let Some(user) = &cfg.rpc_user {
-        let pw = if cfg.rpc_password.is_some() {
-            "password set in the file"
-        } else {
-            "no password"
-        };
-        println!("rpc_user: {user} ({pw})");
-    }
+    // Whether, never who: the user name is as private as the password.
+    println!(
+        "rpc_auth: {}",
+        match (&cfg.rpc_user, &cfg.rpc_password) {
+            (Some(_), Some(_)) => "user and password set in the file",
+            (Some(_), None) => "user set in the file (no password)",
+            (None, Some(_)) => "password set in the file (no user)",
+            (None, None) => "cookie only",
+        }
+    );
     println!("sources:");
     for s in &cfg.sources {
         match &s.route {
             Route::Tor(socks) => println!("  {} {} via Tor at {socks}", s.name, s.url),
             Route::Direct => println!("  {} {} directly", s.name, s.url),
+        }
+    }
+}
+
+/// The RPC user and password are file-only; say so if someone tried the
+/// environment, which `docker inspect` would expose. Names only, never values.
+fn warn_ignored_credentials() {
+    for var in ["TRUST_ISSUES_RPC_PASSWORD", "TRUST_ISSUES_RPC_USER"] {
+        if std::env::var_os(var).is_some() {
+            eprintln!(
+                "warning: {var} is ignored on purpose (the environment is visible to docker inspect); use the config file or the cookie"
+            );
         }
     }
 }
@@ -227,6 +300,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if !matches!(cli.command, Some(Command::HealthCheck { .. })) {
+        warn_ignored_credentials();
+    }
     let cfg = match load(&cli) {
         Ok(c) => c,
         Err(e) if matches!(cli.command, Some(Command::CheckConfig)) => {

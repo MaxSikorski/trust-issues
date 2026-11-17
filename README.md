@@ -21,7 +21,13 @@ So I wanted the light setup without the blind trust. Ask several explorers over 
 
 Credit where it's due: [trustedcoin](https://github.com/nbd-wtf/trustedcoin) showed that Core Lightning can run on explorers. Neutrino showed how far light clients can go. Blockstream's Esplora API and [mempool.space](https://mempool.space) make all of this possible, and they do it for free. Thank you!
 
-## Watch it catch a liar (60 seconds, no setup)
+## Watch it catch a liar
+
+![The liar demo in a terminal: five lies, five caught](docs/liar-demo.gif)
+
+**In your browser, no install:** https://maxsikorski.github.io/trust-issues/
+
+**Or in a terminal, no setup:**
 
 ```bash
 cargo run --locked --example liar
@@ -36,13 +42,7 @@ We set up three fake explorers on a made-up chain: alice and bob are honest, mal
 
 You watch the real code catch each lie. There's no Tor, no network and no coins. Add `--fast` to skip the pauses. If a check ever fails to catch a lie, the demo says so and exits with an error. I'd rather it tell on itself than look good.
 
-**Or in your browser.** [`docs/`](docs/) has a web version of the same five scenes. It's the real Rust code compiled to WebAssembly (about 470 KB, no imports, no network), so the checks run on your own machine, and the page just replays them slowly. To try it locally:
-
-```bash
-uv run --no-project python -m http.server 8765 -d docs
-```
-
-Then open http://localhost:8765. `docs/build.sh` rebuilds the WebAssembly file from source.
+The browser version is the same five scenes, run by the real Rust code compiled to WebAssembly (about 470 KB, no network). It lives in [`docs/`](docs/), and `docs/build.sh` rebuilds it from source.
 
 ## What milestone 1 does
 - **Headers:** we follow the chain from a checkpoint and take the **valid chain with the most work** that any explorer shows. Proof of work, links, difficulty rules and timestamps are checked on every header. It's proof, not a vote: one honest explorer is enough.

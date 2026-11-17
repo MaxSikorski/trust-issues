@@ -3,8 +3,17 @@
 #   export TI_WALLETS=$HOME/ti-wallets      # a real, backed-up folder
 # NEVER inside the repo, and never in a temp or scratch folder: a wallet in a
 # folder that gets cleaned up is lost funds. Signet coins, but still.
-# Create the folders first: tor, trust-issues, cln, lnd.
-# The trust-issues folder must be writable by uid 10001 (chown 10001:10001).
+#
+# Create the folders first, mode 0700, with the right owners. On Linux:
+#   mkdir -p "$TI_WALLETS"/{tor,trust-issues,cln,lnd}
+#   chmod 0700 "$TI_WALLETS"/{tor,trust-issues,cln,lnd}
+#   sudo chown 100:101 "$TI_WALLETS"/tor              # debian-tor in the tor image
+#   sudo chown 10001:10001 "$TI_WALLETS"/trust-issues  # the trust-issues user
+# cln and lnd run as root, so those two stay owned by root:
+#   sudo chown root:root "$TI_WALLETS"/{cln,lnd}
+# (Check the tor numbers: docker run --rm --entrypoint id <tor image> debian-tor
+# printed uid=100 gid=101 for the image I built.) On Docker Desktop for Mac the
+# owners don't matter; the chmod still does.
 
 services:
   tor:

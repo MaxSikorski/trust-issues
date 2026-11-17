@@ -1,12 +1,19 @@
 # Tor + Trust Issues + one Lightning node, on signet only.
 #   docker compose --profile cln up     (Core Lightning)
 #   docker compose --profile lnd up     (LND)
-# One internal network. Nothing is published to the host.
+# Two networks, nothing published to the host:
+#   backend (internal, fixed subnet 172.31.250.0/24): tor, trust-issues, cln, lnd.
+#   egress (normal bridge): tor (to reach the Tor network) and the Lightning
+#   nodes (they need Lightning peers).
+# Trust Issues is on backend ONLY, so it physically cannot reach anything but
+# Tor and the Lightning node. That is the strongest no-clearnet guarantee here.
+# The subnet is also in docker/tor/torrc (SocksPolicy); change both together.
 #
-# The RPC cookie (/data/.cookie) is mode 0600, owned by uid 10001 in the
-# trust-issues container. The cln and lnd images run as root, and root reads
-# any file through a read-only mount, so no permission change is needed. Do not
-# add `user:` or `cap_drop: [DAC_OVERRIDE]` to cln or lnd, or they lose access.
+# The RPC cookie (/data/.cookie) is owned by uid 10001 in the trust-issues
+# container. The cln and lnd images run as root and read it through a read-only
+# mount. That also lets them read the whole trust-issues volume. Today the
+# volume holds only the cookie; revisit this when on-disk state lands there.
+# Do not add `user:` or `cap_drop: [DAC_OVERRIDE]` to cln or lnd.
 
 name: trust-issues
 
@@ -16,7 +23,7 @@ services:
     restart: unless-stopped
     volumes:
       - tor-data:/var/lib/tor
-    networks: [internal]
+    networks: [backend, egress]
 
   trust-issues:
     build: .
@@ -28,15 +35,26 @@ services:
       # TRUST_ISSUES_SOURCES: "name=http://example.onion,name2=http://other.onion"
     volumes:
       - trust-issues-data:/data
+    # Signet sync over Tor took about 90 s for me but can take much longer.
+    # Failed checks during start_period don't count, so compose waits.
+    healthcheck:
+      test: ["CMD", "trust-issues", "health-check", "--synced"]
+      interval: 30s
+      timeout: 10s
+      start_period: 600s
+      retries: 3
     depends_on:
       tor:
         condition: service_healthy
-    networks: [internal]
+    networks: [backend]
 
   cln:
     profiles: [cln]
     image: elementsproject/lightningd:v26.06.10@sha256:59f10c4c7429bb80791481c906859f6de1aa58ef224758aa25d50b7d47fc0c04
     restart: unless-stopped
+    environment:
+      # The image's entrypoint wrapper uses this to find the RPC socket.
+      LIGHTNINGD_NETWORK: signet
     command:
       - --network=signet
       - --bitcoin-rpcconnect=trust-issues
@@ -51,7 +69,7 @@ services:
     depends_on:
       trust-issues:
         condition: service_healthy
-    networks: [internal]
+    networks: [backend, egress]
 
   lnd:
     profiles: [lnd]
@@ -70,10 +88,15 @@ services:
     depends_on:
       trust-issues:
         condition: service_healthy
-    networks: [internal]
+    networks: [backend, egress]
 
 networks:
-  internal: {}
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+  egress: {}
 
 volumes:
   tor-data:

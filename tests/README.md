@@ -56,6 +56,17 @@ Two examples are not tests:
 | needs_two_sources_and_respects_the_request_ceiling | At least two sources; no more than 2 requests/s; unknown keys refused |
 | checkpoint_parses_height_and_hash | `height:hash` format |
 
+## config_env.rs: settings from flags and environment variables (7)
+| Test | Checks |
+|---|---|
+| environment_variables_alone_are_enough | No file needed: network, Tor, bind and data dir from the environment, default onion sources |
+| flags_beat_environment_variables_which_beat_the_file | Precedence: flag, then environment variable, then file |
+| neither_a_flag_nor_an_environment_variable_can_pick_mainnet | Mainnet and testnets are refused from both routes |
+| sources_from_the_environment_follow_the_same_rules | Clearnet, a single source and malformed lists are refused; onion plus a home machine is routed correctly |
+| the_network_must_be_set_somewhere | No network anywhere is an error |
+| passwords_never_come_from_flags_or_the_environment | `--rpc-user`/`--rpc-password` don't exist, the env var is ignored, the password is never printed |
+| the_old_command_lines_still_work | `health-check --config F [--synced]` still works |
+
 ## adversarial.rs: lying, hiding and failing sources (16)
 | Test | Checks |
 |---|---|
@@ -101,4 +112,4 @@ Two examples are not tests:
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 67 tests.**
+**Total: 74 tests.**

@@ -98,7 +98,7 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    network: String,
+    network: Option<String>,
     rpc_bind: Option<String>,
     rpc_user: Option<String>,
     rpc_password: Option<String>,
@@ -184,49 +184,114 @@ pub fn default_sources(network: Network) -> Vec<(String, String)> {
     ]
 }
 
+/// Settings given on the command line or in the environment. Each one, when
+/// present, beats the config file. The RPC user and password are missing on
+/// purpose: `ps` and `docker inspect` would show them.
+#[derive(Debug, Default, Clone)]
+pub struct Overrides {
+    pub network: Option<String>,
+    pub tor_socks: Option<String>,
+    pub rpc_bind: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub poll_interval_secs: Option<u64>,
+    pub checkpoint: Option<String>,
+    pub requests_per_sec: Option<f64>,
+    pub fee_ceiling_sat_vb: Option<f64>,
+    /// `name=url,name=url`; replaces the file's sources entirely.
+    pub sources: Option<String>,
+}
+
+/// Strict on purpose: a half-read list could silently drop a source.
+fn parse_sources_list(s: &str) -> Result<Vec<(String, String)>, ConfigError> {
+    let bad = |entry: &str| {
+        ConfigError::BadValue(format!(
+            "sources entry {entry:?} must look like name=url (no empty entries)"
+        ))
+    };
+    s.split(',')
+        .map(|entry| {
+            let (name, url) = entry.split_once('=').ok_or_else(|| bad(entry))?;
+            let (name, url) = (name.trim(), url.trim());
+            if name.is_empty() || url.is_empty() {
+                return Err(bad(entry));
+            }
+            Ok((name.to_string(), url.to_string()))
+        })
+        .collect()
+}
+
 pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
-    let file: FileConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
-    let network = parse_network(&file.network)?;
+    load_config(Some(text), &Overrides::default())
+}
+
+/// Merge the optional file with the overrides (override, then file, then
+/// default) and run every safety check on the result.
+pub fn load_config(file_text: Option<&str>, o: &Overrides) -> Result<Config, ConfigError> {
+    let file: FileConfig =
+        toml::from_str(file_text.unwrap_or("")).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let network_name = o
+        .network
+        .as_deref()
+        .or(file.network.as_deref())
+        .ok_or_else(|| {
+            ConfigError::BadValue("network must be set: signet (or regtest for tests)".into())
+        })?;
+    let network = parse_network(network_name)?;
     let default_port = match network {
         Network::Signet => 38332,
         _ => 18443,
     };
-    let rpc_bind: SocketAddr = file
+    let rpc_bind: SocketAddr = o
         .rpc_bind
         .as_deref()
+        .or(file.rpc_bind.as_deref())
         .unwrap_or(&format!("127.0.0.1:{default_port}"))
         .parse()
         .map_err(|_| {
             ConfigError::BadValue("rpc_bind must be an address like 127.0.0.1:38332".into())
         })?;
 
-    let requests_per_sec = file.requests_per_sec.unwrap_or(DEFAULT_REQUESTS_PER_SEC);
+    let requests_per_sec = o
+        .requests_per_sec
+        .or(file.requests_per_sec)
+        .unwrap_or(DEFAULT_REQUESTS_PER_SEC);
     if !(requests_per_sec > 0.0 && requests_per_sec <= HARD_MAX_REQUESTS_PER_SEC) {
         return Err(ConfigError::BadValue(format!(
             "requests_per_sec must be above 0 and at most {HARD_MAX_REQUESTS_PER_SEC}"
         )));
     }
-    let fee_ceiling_sat_vb = file.fee_ceiling_sat_vb.unwrap_or(1000.0);
+    let fee_ceiling_sat_vb = o
+        .fee_ceiling_sat_vb
+        .or(file.fee_ceiling_sat_vb)
+        .unwrap_or(1000.0);
     if fee_ceiling_sat_vb.is_nan() || fee_ceiling_sat_vb < 1.0 {
         return Err(ConfigError::BadValue(
             "fee_ceiling_sat_vb must be at least 1".into(),
         ));
     }
-    let poll_interval_secs = file.poll_interval_secs.unwrap_or(60).max(10);
-    let checkpoint = file
+    let poll_interval_secs = o
+        .poll_interval_secs
+        .or(file.poll_interval_secs)
+        .unwrap_or(60)
+        .max(10);
+    let checkpoint = o
         .checkpoint
         .as_deref()
+        .or(file.checkpoint.as_deref())
         .map(parse_checkpoint)
         .transpose()?;
+    let tor_socks = o.tor_socks.as_deref().or(file.tor_socks.as_deref());
 
-    let raw_sources: Vec<(String, String)> = if file.sources.is_empty() {
+    let raw_sources: Vec<(String, String)> = if let Some(list) = &o.sources {
+        parse_sources_list(list)?
+    } else if file.sources.is_empty() {
         default_sources(network)
     } else {
         file.sources.into_iter().map(|s| (s.name, s.url)).collect()
     };
     let mut sources = Vec::new();
     for (name, url) in raw_sources {
-        let route = route_for(&url, file.tor_socks.as_deref())?;
+        let route = route_for(&url, tor_socks)?;
         sources.push(SourceSpec {
             name,
             url: url.trim_end_matches('/').to_string(),
@@ -244,7 +309,11 @@ pub fn parse_config(text: &str) -> Result<Config, ConfigError> {
         rpc_bind,
         rpc_user: file.rpc_user,
         rpc_password: file.rpc_password,
-        data_dir: file.data_dir.unwrap_or_else(|| PathBuf::from(".data")),
+        data_dir: o
+            .data_dir
+            .clone()
+            .or(file.data_dir)
+            .unwrap_or_else(|| PathBuf::from(".data")),
         poll_interval_secs,
         checkpoint,
         fee_ceiling_sat_vb,

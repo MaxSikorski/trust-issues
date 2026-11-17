@@ -1,13 +1,17 @@
-//! `trust-issues --config <file>`: run the stand-in bitcoind.
-//! `trust-issues health-check --config <file> [--synced]`: ask a running one
-//! whether it's up (and synced), for Docker's HEALTHCHECK and scripts.
+//! `trust-issues [--config <file>] [flags]`: run the stand-in bitcoind.
+//! `trust-issues health-check [--synced]`: ask a running one whether it's up
+//! (and synced), for Docker's HEALTHCHECK and scripts.
+//! `trust-issues check-config`: print the settings and exit.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
 use tracing::{info, warn};
-use trust_issues::config::parse_config;
+use trust_issues::config::{Config, Overrides, Route, load_config};
 use trust_issues::esplora::EsploraSource;
 use trust_issues::limits::{DEFAULT_BURST, os_jitter};
 use trust_issues::node::{Node, Settings, SystemClock};
@@ -15,10 +19,105 @@ use trust_issues::rpc::{Auth, router};
 use trust_issues::source::Source;
 use trust_issues::systemd;
 
-fn usage() -> ! {
-    eprintln!("usage: trust-issues --config <file.toml>");
-    eprintln!("       trust-issues health-check --config <file.toml> [--synced]");
-    std::process::exit(2);
+/// Settings come from these flags, then `TRUST_ISSUES_*` variables, then the
+/// config file. The RPC user and password are file-only on purpose.
+#[derive(Parser)]
+#[command(
+    version,
+    about = "A stand-in bitcoind that reads the chain from block explorers over Tor"
+)]
+struct Cli {
+    /// Optional config file (TOML)
+    #[arg(long, global = true, env = "TRUST_ISSUES_CONFIG")]
+    config: Option<PathBuf>,
+    /// signet (or regtest for tests)
+    #[arg(long, global = true, env = "TRUST_ISSUES_NETWORK")]
+    network: Option<String>,
+    /// Address of Tor's SOCKS port, like 127.0.0.1:9050
+    #[arg(long, global = true, env = "TRUST_ISSUES_TOR_SOCKS")]
+    tor_socks: Option<String>,
+    /// Where the RPC listens, like 127.0.0.1:38332
+    #[arg(long, global = true, env = "TRUST_ISSUES_RPC_BIND")]
+    rpc_bind: Option<String>,
+    /// Where the cookie file goes
+    #[arg(long, global = true, env = "TRUST_ISSUES_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+    #[arg(long, global = true, env = "TRUST_ISSUES_POLL_INTERVAL_SECS")]
+    poll_interval_secs: Option<u64>,
+    /// "<height>:<block hash>"
+    #[arg(long, global = true, env = "TRUST_ISSUES_CHECKPOINT")]
+    checkpoint: Option<String>,
+    #[arg(long, global = true, env = "TRUST_ISSUES_REQUESTS_PER_SEC")]
+    requests_per_sec: Option<f64>,
+    #[arg(long, global = true, env = "TRUST_ISSUES_FEE_CEILING_SAT_VB")]
+    fee_ceiling_sat_vb: Option<f64>,
+    /// name=url,name=url (replaces the file's sources)
+    #[arg(long, global = true, env = "TRUST_ISSUES_SOURCES")]
+    sources: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Ask a running server whether it's up (for Docker's HEALTHCHECK)
+    HealthCheck {
+        /// Also require it to be synced
+        #[arg(long)]
+        synced: bool,
+    },
+    /// Read and check the settings, print them, and exit (no network)
+    CheckConfig,
+}
+
+fn load(cli: &Cli) -> Result<Config> {
+    let text = match &cli.config {
+        Some(p) => {
+            Some(std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?)
+        }
+        None => None,
+    };
+    let o = Overrides {
+        network: cli.network.clone(),
+        tor_socks: cli.tor_socks.clone(),
+        rpc_bind: cli.rpc_bind.clone(),
+        data_dir: cli.data_dir.clone(),
+        poll_interval_secs: cli.poll_interval_secs,
+        checkpoint: cli.checkpoint.clone(),
+        requests_per_sec: cli.requests_per_sec,
+        fee_ceiling_sat_vb: cli.fee_ceiling_sat_vb,
+        sources: cli.sources.clone(),
+    };
+    load_config(text.as_deref(), &o).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Print the settings that would be used. Never the password.
+fn print_config(cfg: &Config) {
+    println!("network: {}", cfg.network);
+    println!("rpc_bind: {}", cfg.rpc_bind);
+    println!("data_dir: {}", cfg.data_dir.display());
+    println!("poll_interval_secs: {}", cfg.poll_interval_secs);
+    match &cfg.checkpoint {
+        Some((h, hash)) => println!("checkpoint: {h}:{hash}"),
+        None => println!("checkpoint: none"),
+    }
+    println!("requests_per_sec: {}", cfg.requests_per_sec);
+    println!("fee_ceiling_sat_vb: {}", cfg.fee_ceiling_sat_vb);
+    if let Some(user) = &cfg.rpc_user {
+        let pw = if cfg.rpc_password.is_some() {
+            "password set in the file"
+        } else {
+            "no password"
+        };
+        println!("rpc_user: {user} ({pw})");
+    }
+    println!("sources:");
+    for s in &cfg.sources {
+        match &s.route {
+            Route::Tor(socks) => println!("  {} {} via Tor at {socks}", s.name, s.url),
+            Route::Direct => println!("  {} {} directly", s.name, s.url),
+        }
+    }
 }
 
 /// Ask the running server on this machine for `GET /health`. Exits 0 when
@@ -127,21 +226,22 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let (path, health, require_synced) = match args.as_slice() {
-        [_, flag, p] if flag == "--config" => (p.clone(), false, false),
-        [_, cmd, flag, p] if cmd == "health-check" && flag == "--config" => {
-            (p.clone(), true, false)
+    let cli = Cli::parse();
+    let cfg = match load(&cli) {
+        Ok(c) => c,
+        Err(e) if matches!(cli.command, Some(Command::CheckConfig)) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
         }
-        [_, cmd, flag, p, s] if cmd == "health-check" && flag == "--config" && s == "--synced" => {
-            (p.clone(), true, true)
-        }
-        _ => usage(),
+        Err(e) => return Err(e),
     };
-    let text = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-    let cfg = parse_config(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if health {
-        health_check(cfg.rpc_bind, require_synced).await;
+    match cli.command {
+        Some(Command::CheckConfig) => {
+            print_config(&cfg);
+            return Ok(());
+        }
+        Some(Command::HealthCheck { synced }) => health_check(cfg.rpc_bind, synced).await,
+        None => {}
     }
     if !cfg.rpc_bind.ip().is_loopback() {
         warn!(bind = %cfg.rpc_bind, "RPC is listening beyond this machine; keep it on a private network");

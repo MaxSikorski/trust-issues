@@ -84,11 +84,22 @@ pub trait Source: Send + Sync {
     async fn broadcast(&self, tx_hex: &str) -> Result<Txid, SourceError>;
 }
 
+/// Characters that are not "control" to Rust but still fake line breaks,
+/// reorder text or hide it: zero-width and direction marks (U+200B-200F,
+/// U+061C), line/paragraph separators and bidi overrides (U+2028-202E),
+/// invisible operators and bidi isolates (U+2060-206F), U+180E, U+FEFF.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{61c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{feff}')
+}
+
 /// Keep only printable characters and at most 200 of them: answers from
-/// sources are untrusted text.
+/// sources are untrusted text. Control characters (including U+0085) and the
+/// invisible ones above are dropped.
 pub fn clean_text(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .take(200)
         .collect::<String>()
         .trim()

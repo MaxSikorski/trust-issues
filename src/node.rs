@@ -1541,7 +1541,17 @@ impl Node {
     /// room for it; the set can't grow past [`UNSUPPORTED_RPC_MAX`].
     pub fn note_unsupported_rpc(&self, cleaned: &str) -> bool {
         let mut set = lock(&self.unsupported_rpc);
-        set.len() < UNSUPPORTED_RPC_MAX && set.insert(cleaned.to_string())
+        if set.len() >= UNSUPPORTED_RPC_MAX || !set.insert(cleaned.to_string()) {
+            return false;
+        }
+        if set.len() == UNSUPPORTED_RPC_MAX {
+            // The set never shrinks, so this happens once.
+            warn!(
+                max = UNSUPPORTED_RPC_MAX,
+                "the unsupported-RPC list is full; later method names won't be listed"
+            );
+        }
+        true
     }
 
     pub fn status(&self) -> Value {

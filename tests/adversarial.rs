@@ -367,3 +367,43 @@ async fn a_rate_limited_source_cools_off_while_the_others_carry_on() {
     assert!(a.with(|s| s.calls) > calls, "back after Retry-After");
     let _ = OutPoint::null();
 }
+
+#[test]
+fn clean_text_removes_ascii_and_c1_controls() {
+    use trust_issues::source::clean_text;
+    assert_eq!(clean_text("a\nb\r\tc\u{7}d\u{1b}[31m"), "abcd[31m");
+    assert_eq!(
+        clean_text("a\u{85}b"),
+        "ab",
+        "U+0085 is a line break to some viewers"
+    );
+}
+
+#[test]
+fn clean_text_removes_unicode_line_and_paragraph_separators() {
+    use trust_issues::source::clean_text;
+    assert_eq!(clean_text("a\u{2028}b\u{2029}c"), "abc");
+}
+
+#[test]
+fn clean_text_removes_bidi_overrides_and_isolates() {
+    use trust_issues::source::clean_text;
+    for c in ('\u{202a}'..='\u{202e}').chain('\u{2066}'..='\u{2069}') {
+        assert_eq!(clean_text(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+    }
+    assert_eq!(clean_text("a\u{200e}b\u{200f}c\u{61c}d"), "abcd");
+}
+
+#[test]
+fn clean_text_removes_zero_width_and_invisible_format_characters() {
+    use trust_issues::source::clean_text;
+    assert_eq!(
+        clean_text("a\u{200b}b\u{200c}c\u{200d}d\u{2060}e\u{feff}f"),
+        "abcdef"
+    );
+    assert_eq!(
+        clean_text("héllo wörld ₿"),
+        "héllo wörld ₿",
+        "ordinary text survives"
+    );
+}

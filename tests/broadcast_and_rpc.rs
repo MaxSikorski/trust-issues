@@ -841,3 +841,189 @@ async fn params_never_appear_on_status() {
     assert!(text.contains("importprivkey"));
     assert!(!text.contains("SECRETPARAM"));
 }
+
+// ---------- RPC logging: review fixes ----------
+
+fn big_batch(n: usize, method: &str) -> Vec<u8> {
+    let items: Vec<Value> = (0..n)
+        .map(|i| json!({"id": i, "method": method, "params": []}))
+        .collect();
+    Value::Array(items).to_string().into_bytes()
+}
+
+#[tokio::test]
+async fn an_oversize_batch_gets_one_error_and_nothing_is_processed_or_listed() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let (status, v) = process_body(&node, &big_batch(257, "nope_batch")).await;
+    assert_eq!(status, 400);
+    assert!(v.is_object(), "one error, not an array of answers: {v}");
+    assert_eq!(v["error"]["code"], -32600);
+    assert!(unsupported_list(&node).is_empty(), "no item was processed");
+    // The largest allowed batch is still answered item by item.
+    let (status, v) = process_body(&node, &big_batch(256, "getblockcount")).await;
+    assert_eq!(status, 200);
+    assert_eq!(v.as_array().unwrap().len(), 256);
+}
+
+#[tokio::test]
+async fn unsupported_means_not_in_our_list_whatever_the_answer_was() {
+    let blocks = build_chain(2, 1);
+    // A supported method whose upstream error happens to be -32601 is not "unsupported".
+    let a = FakeSource::honest("a", &blocks);
+    a.with(|s| {
+        s.reject_body = Some(
+            "sendrawtransaction RPC error: {\"code\":-32601,\"message\":\"Method not found\"}"
+                .into(),
+        )
+    });
+    let (node, _) = started_node(&[a], &blocks).await;
+    let tx = spend(&blocks[1].txdata[0], 0, 4000, 8);
+    let (_, v) = rpc(&node, "sendrawtransaction", json!([tx_hex(&tx)])).await;
+    assert_eq!(v["error"]["code"], -32601, "the upstream code is passed on");
+    assert!(unsupported_list(&node).is_empty());
+
+    // An unknown method asked while still warming up (answer -28) is listed.
+    let cold = Node::new(
+        settings(None),
+        vec![FakeSource::honest("a", &blocks) as Arc<dyn Source>],
+        Arc::new(ManualClock::new(1)),
+    );
+    let (_, v) = rpc(&cold, "nope_warmup", json!([])).await;
+    assert_eq!(v["error"]["code"], -28);
+    assert_eq!(unsupported_list(&cold), vec!["nope_warmup"]);
+    // And a supported one asked while warming up is not.
+    rpc(&cold, "getblockcount", json!([])).await;
+    assert_eq!(unsupported_list(&cold), vec!["nope_warmup"]);
+}
+
+#[derive(Clone, Default)]
+struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogSink {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+    fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let sink = self.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::set_default(sub)
+    }
+}
+
+#[tokio::test]
+async fn the_log_names_the_method_but_never_the_params() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let sink = LogSink::default();
+    let _g = sink.capture();
+    rpc(&node, "getblockhash", json!(["SECRETPARAM-1"])).await;
+    rpc(&node, "nope_logged", json!({"k": "SECRETPARAM-2"})).await;
+    let text = sink.text();
+    assert!(
+        text.contains("getblockhash"),
+        "debug line names the method: {text}"
+    );
+    assert!(
+        text.contains("nope_logged"),
+        "warning names the method: {text}"
+    );
+    assert!(
+        !text.contains("SECRETPARAM"),
+        "params leaked into the log: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_full_unsupported_list_warns_once() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let sink = LogSink::default();
+    let _g = sink.capture();
+    for i in 0..70 {
+        rpc(&node, &format!("nope{i}"), json!([])).await;
+    }
+    assert_eq!(unsupported_list(&node).len(), 64);
+    let full = sink
+        .text()
+        .lines()
+        .filter(|l| l.contains("list is full"))
+        .count();
+    assert_eq!(full, 1, "exactly one warning that the list is full");
+}
+
+#[tokio::test]
+async fn an_unauthenticated_unknown_method_gets_401_and_is_not_listed() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let app = router(
+        node.clone(),
+        Auth {
+            cookie_password: "c00k1e".into(),
+            user: Some("lnd".into()),
+            password: Some("pw".into()),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{addr}/");
+    let body = json!({"id": 1, "method": "nope_unauth"}).to_string();
+    let r = client.post(&url).body(body.clone()).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let r = client
+        .post(&url)
+        .basic_auth("lnd", Some("wrong"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert!(unsupported_list(&node).is_empty());
+    // With a login it is listed, so the empty list above means something.
+    let r = client
+        .post(&url)
+        .basic_auth("lnd", Some("pw"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+    assert_eq!(unsupported_list(&node), vec!["nope_unauth"]);
+}
+
+#[test]
+fn every_supported_method_is_known_to_the_dispatcher() {
+    // One list, used by `help`, by the "unsupported" check and by this test.
+    let blocks = build_chain(2, 1);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+        for m in trust_issues::rpc::SUPPORTED {
+            let (_, v) = rpc(&node, m, json!([])).await;
+            assert_ne!(
+                v["error"]["code"], -32601,
+                "{m} is listed but not dispatched"
+            );
+        }
+        assert!(unsupported_list(&node).is_empty());
+    });
+}

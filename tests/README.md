@@ -88,7 +88,7 @@ Two examples are not tests:
 | a_url_that_cannot_be_shown_safely_is_never_echoed | Malformed source URLs with a login (env and file) never appear in the output |
 | a_tor_address_with_a_login_is_refused_and_never_printed | `tor_socks` with `user:pw@` is refused from env and file, never printed |
 
-## adversarial.rs: lying, hiding and failing sources (16)
+## adversarial.rs: lying, hiding and failing sources (20)
 | Test | Checks |
 |---|---|
 | two_honest_sources_mean_synced_at_their_tip | The happy path, no alarms |
@@ -107,8 +107,12 @@ Two examples are not tests:
 | an_unconfirmed_output_is_answered_as_null | Fail closed on unconfirmed funding |
 | fees_combine_across_sources_and_disagreement_raises_an_alarm | Median, max when urgent, alarm above 2× |
 | a_rate_limited_source_cools_off_while_the_others_carry_on | 429 + Retry-After: no requests while cooling, back afterwards |
+| clean_text_removes_ascii_and_c1_controls | Control characters, escape bytes and U+0085 are dropped |
+| clean_text_removes_unicode_line_and_paragraph_separators | U+2028 and U+2029 are dropped |
+| clean_text_removes_bidi_overrides_and_isolates | U+202A-202E, U+2066-2069 and direction marks are dropped |
+| clean_text_removes_zero_width_and_invisible_format_characters | Zero-width and invisible format characters are dropped; ordinary text survives |
 
-## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (34)
+## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (40)
 | Test | Checks |
 |---|---|
 | broadcast_goes_to_every_source_and_succeeds_if_any_accepts | Every source is sent it; one acceptance is success |
@@ -145,6 +149,12 @@ Two examples are not tests:
 | a_dirty_long_method_name_is_cleaned_and_truncated_in_the_list | Control characters are stripped and names cut to 200 characters |
 | the_unsupported_list_is_capped | At most 64 distinct names are kept |
 | params_never_appear_on_status | Request params never reach `/status` |
+| an_oversize_batch_gets_one_error_and_nothing_is_processed_or_listed | A batch over 256 requests gets one -32600 error and nothing is run or listed; 256 still works |
+| unsupported_means_not_in_our_list_whatever_the_answer_was | A supported method with an upstream -32601 isn't listed; an unknown one asked during warm-up (-28) is |
+| the_log_names_the_method_but_never_the_params | Captured logs contain the method name and never the params |
+| a_full_unsupported_list_warns_once | Reaching 64 names logs one "list is full" warning; the list never grows past 64 |
+| an_unauthenticated_unknown_method_gets_401_and_is_not_listed | Over HTTP, no or wrong login gets 401 and the name isn't listed; a good login lists it |
+| every_supported_method_is_known_to_the_dispatcher | Every name in `SUPPORTED` is dispatched (never -32601) |
 
 ## src/main.rs: the program itself (2)
 | Test | Checks |
@@ -157,4 +167,4 @@ Two examples are not tests:
 |---|---|
 | retry_after_on_a_503_is_a_rate_limit | A 503 with `Retry-After` is a slow-down like a 429; a bare 503 stays a server error |
 
-**Total: 111 tests.**
+**Total: 121 tests.**

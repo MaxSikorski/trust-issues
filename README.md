@@ -115,7 +115,7 @@ Mainnet stays off until someone outside the project has reviewed it. Even then, 
 cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo deny --locked check
 ```
 
-All 66 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
+All 67 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
 
 ## Found a problem?
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.

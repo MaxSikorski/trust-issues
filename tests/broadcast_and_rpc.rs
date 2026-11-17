@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use trust_issues::node::{
     BROADCAST_ALARM_SECS, BROADCAST_FIRST_CHECK_SECS, ManualClock, Node, header_hex,
 };
-use trust_issues::rpc::{Auth, process_body, router};
+use trust_issues::rpc::{Auth, process_body, router, to_core_json};
 use trust_issues::source::{Source, SourceError};
 
 fn has_alarm(node: &Node, prefix: &str) -> bool {
@@ -559,4 +559,24 @@ async fn an_old_answer_that_contradicts_the_checkpoint_is_refused() {
         "{v}"
     );
     assert!(alarm_codes(&node).contains(&"old-block-disagreement".to_string()));
+}
+
+#[test]
+fn amounts_are_written_with_eight_decimals_like_bitcoin_core() {
+    // Core Lightning's bcli refuses "0.00001"; Core itself writes "0.00001000".
+    let v = json!({
+        "mempoolminfee": 0.00001,
+        "feerate": 0.0002,
+        "size": 3,
+        "ratio": 0.5,
+        "vout": [{"value": 50, "n": 0}],
+        "name": "value",
+    });
+    assert_eq!(
+        to_core_json(&v),
+        r#"{"feerate":0.00020000,"mempoolminfee":0.00001000,"name":"value","ratio":0.5,"size":3,"vout":[{"n":0,"value":50.00000000}]}"#
+    );
+    // And it is still valid JSON that reads back to the same numbers.
+    let back: Value = serde_json::from_str(&to_core_json(&v)).unwrap();
+    assert_eq!(back["mempoolminfee"], 0.00001);
 }

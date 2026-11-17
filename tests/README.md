@@ -76,7 +76,7 @@ Two examples are not tests:
 | fees_combine_across_sources_and_disagreement_raises_an_alarm | Median, max when urgent, alarm above 2× |
 | a_rate_limited_source_cools_off_while_the_others_carry_on | 429 + Retry-After: no requests while cooling, back afterwards |
 
-## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (20)
+## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (21)
 | Test | Checks |
 |---|---|
 | broadcast_goes_to_every_source_and_succeeds_if_any_accepts | Every source is sent it; one acceptance is success |
@@ -99,5 +99,6 @@ Two examples are not tests:
 | a_lone_dissenter_is_outvoted_for_old_blocks_but_reported | Two votes and a strict majority win; the dissent is still reported |
 | a_chain_block_offered_as_an_old_one_is_refused | A block on our proven chain can't be served as an older height |
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
+| amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 66 tests.**
+**Total: 67 tests.**

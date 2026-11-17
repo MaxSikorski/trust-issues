@@ -133,9 +133,62 @@ async fn handle_rpc(State(s): State<AppState>, headers: HeaderMap, body: Bytes) 
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
-        value.to_string(),
+        to_core_json(&value),
     )
         .into_response()
+}
+
+/// Fields Bitcoin Core prints as BTC amounts.
+const AMOUNT_KEYS: &[&str] = &[
+    "value",
+    "feerate",
+    "relayfee",
+    "incrementalfee",
+    "mempoolminfee",
+    "minrelaytxfee",
+    "incrementalrelayfee",
+    "total_fee",
+];
+
+/// JSON text the way Bitcoin Core writes it: amounts always with exactly 8
+/// decimals (`0.00001000`, not `0.00001`). Core Lightning's `bcli` parses
+/// amounts strictly and refuses any other form.
+pub fn to_core_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_core_json(v, false, &mut out);
+    out
+}
+
+fn write_core_json(v: &Value, amount: bool, out: &mut String) {
+    match v {
+        Value::Number(n) if amount => match n.as_f64() {
+            Some(f) => out.push_str(&format!("{f:.8}")),
+            None => out.push_str(&n.to_string()),
+        },
+        Value::Array(items) => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_core_json(x, false, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, x)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                write_core_json(x, AMOUNT_KEYS.contains(&k.as_str()), out);
+            }
+            out.push('}');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// Handle one HTTP body: a single request or a batch. Public so tests can

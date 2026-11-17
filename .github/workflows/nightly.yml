@@ -1,0 +1,92 @@
+# Nightly: everything the merge gate runs, plus the checks that are too slow
+# or too noisy for every pull request. Also runnable by hand (Actions tab).
+name: nightly
+
+on:
+  schedule:
+    # Once a day, 03:29 UTC. An odd minute, because the top of the hour is busy.
+    - cron: "29 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+# One nightly run at a time; a manual run waits for a running one to finish.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # Everything in test.yml (fmt, clippy, clippy-core, test, test-aarch64, deny,
+  # demo).
+  gate:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  # There is no separate advisories job: `gate / deny` above runs the full
+  # `cargo deny --locked check`, which includes the RustSec advisory check, so
+  # new advisories against an unchanged Cargo.lock still turn the nightly red.
+
+  # Build the browser demo's WebAssembly engine from src/ on a clean Linux
+  # runner and check that it still works: it loads with no imports, and the
+  # five demo scenes catch all five lies. The bytes are NOT compared with the
+  # committed docs/trust_issues.wasm: Linux clang output differs from the
+  # macOS build, so a byte match would fail for no real reason. The check is
+  # on behaviour instead.
+  wasm:
+    name: wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      # secp256k1's C code is compiled for wasm32, which needs clang. The
+      # build script adds the wasm32 target and llvm-tools itself.
+      - name: Install clang
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang
+      - name: Build the WebAssembly module
+        timeout-minutes: 15
+        run: ./docs/build.sh
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Load the module and check the demo result
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+          import assert from "node:assert/strict";
+
+          const bytes = readFileSync("docs/trust_issues.wasm");
+          const module = await WebAssembly.compile(bytes);
+          // A module that asks for nothing from outside can't reach the
+          // network, the disk or the clock.
+          assert.equal(WebAssembly.Module.imports(module).length, 0, "the module has imports");
+
+          const { exports } = await WebAssembly.instantiate(module, {});
+          const ptr = exports.demo_run();
+          const len = exports.demo_len();
+          const json = new TextDecoder("utf-8", { fatal: true })
+            .decode(new Uint8Array(exports.memory.buffer, ptr, len));
+          const events = JSON.parse(json);
+          assert.ok(Array.isArray(events), "the demo did not return a list of events");
+
+          const caught = events.filter((e) => e.kind === "caught").length;
+          const missed = events.filter((e) => e.kind === "missed").length;
+          console.log(`events: ${events.length}, caught: ${caught}, missed: ${missed}`);
+          assert.equal(caught, 5, "expected 5 caught lies");
+          assert.equal(missed, 0, "a lie was not caught");
+          NODE

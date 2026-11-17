@@ -1,0 +1,246 @@
+# The merge gate: every pull request and every push to main runs these jobs.
+# The `main` branch ruleset requires one check, `merge-gate`, which fails
+# unless fmt, clippy, clippy-core, test, test-aarch64, deny and demo all
+# succeeded. Renaming one of those jobs never needs a ruleset change.
+#
+# Nightly (nightly.yml) calls this file as a reusable workflow, so the two
+# can't drift apart.
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+# Read-only. No job here writes to the repository, packages or checks.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the older run of the same PR. Every
+# commit on main has its own group (the commit id), so pushes to main never
+# replace each other's runs. Runs called from nightly are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # No incremental-compilation files: they only help repeated local builds.
+  CARGO_INCREMENTAL: "0"
+  # Compiler warnings fail every job, not just clippy (so the ARM job too).
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      # Docs-only pull requests skip every step below; the job still ends in
+      # success, so merge-gate needs no change.
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      # Current rustup still installs the toolchain on first use, but that is
+      # deprecated. So we install it explicitly; with no arguments this reads
+      # rust-toolchain.toml (exact version, components).
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: cargo fmt
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: cargo clippy
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # The browser-only build: the checking core without the `server` feature
+  # (no Tor, no network, no RPC server), which is what the WebAssembly demo is
+  # built from. The liar example is the demo's command-line twin.
+  clippy-core:
+    name: clippy-core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: cargo clippy (browser-only build)
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo clippy --locked --lib --example liar --no-default-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: cargo build
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo build --locked
+      - name: cargo test
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo test --locked
+
+  # The Pi-class target: 64-bit ARM. GitHub's standard arm64 Linux runners are
+  # free for public repositories.
+  test-aarch64:
+    name: test-aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: cargo build
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo build --locked
+      - name: cargo test
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo test --locked
+
+  deny:
+    name: deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Official release from github.com/EmbarkStudios/cargo-deny, downloaded
+      # and checked against a SHA-256 written here. To update: change the
+      # version, download the asset yourself, hash it, compare with the
+      # project's .sha256 file, and paste the hash.
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      # cargo-deny asks cargo for the dependency list, so cargo has to work.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: Install cargo-deny (checked download)
+        if: steps.scope.outputs.rust == 'true'
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          mkdir -p "${RUNNER_TEMP}/cargo-deny"
+          cd "${RUNNER_TEMP}/cargo-deny"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 \
+            --output "${name}.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  ${name}.tar.gz" | sha256sum -c -
+          tar -xzf "${name}.tar.gz"
+          echo "${RUNNER_TEMP}/cargo-deny/${name}" >> "${GITHUB_PATH}"
+      # The full check: advisories, bans, licenses and sources. Nightly relies
+      # on this for the RustSec advisory check too.
+      - name: cargo deny
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo deny --locked check
+
+  # The liar demo: five lying explorers against the real node code. It exits
+  # non-zero if any lie goes uncaught, so this job proves the checks still
+  # catch what they claim to.
+  demo:
+    name: demo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - id: scope
+        uses: ./.github/actions/changed-scope
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.rust == 'true'
+        timeout-minutes: 10
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show active-toolchain
+      - name: Run the liar demo
+        if: steps.scope.outputs.rust == 'true'
+        run: cargo run --locked --example liar -- --fast
+
+  # The one check the `main` ruleset requires. GitHub counts a skipped
+  # required job as passing, so this fails unless every job above really
+  # succeeded. A new job is only gated if it is added to `needs` here.
+  merge-gate:
+    name: merge-gate
+    if: always()
+    needs: [fmt, clippy, clippy-core, test, test-aarch64, deny, demo]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job above succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            if [ "${result}" != "success" ]; then
+              echo "A required job did not succeed (${result})."
+              exit 1
+            fi
+          done

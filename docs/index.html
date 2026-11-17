@@ -3,8 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Trust Issues: watch it catch a liar</title>
-    <meta name="description" content="Three explorers. One liar. Watch the real Trust Issues code catch every lie, in your browser.">
+    <title>Trust Issues: Lightning without a Bitcoin node</title>
+    <meta name="description" content="Run a Lightning node on public block explorers, checked over Tor. Watch the real Trust Issues code catch lying explorers, in your browser.">
     <meta name="theme-color" content="#000000">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -237,6 +237,10 @@
             margin-bottom: 14px;
         }
 
+        .step { flex-direction: column; align-items: flex-start; }
+        .why { margin: 0 0 16px 1.2em; max-width: 640px; line-height: 1.6; opacity: 0.85; }
+        .why li + li { margin-top: 6px; }
+
         .explorer { flex-direction: column; align-items: flex-start; min-height: 128px; }
         .explorer .state { margin-top: auto; padding-top: 12px; font-size: 0.85rem; font-weight: 500; }
 
@@ -333,13 +337,33 @@
 
     <main class="content-section">
         <header class="page-header">
-            <h1 class="hero-title">Watch it catch a liar.</h1>
-            <p class="hero-subtitle">Three explorers. One liar. The real Trust Issues code, running in your browser.</p>
+            <h1 class="hero-title">Run your own Lightning node without running a Bitcoin node.</h1>
+            <p class="hero-subtitle">Trust Issues lets a Lightning node use public block explorers as its Bitcoin backend. It never trusts just one: it asks several over Tor (a privacy network), checks the proofs, and stops if they disagree.</p>
             <div class="hero-cta">
                 <button class="btn primary-btn" id="run" disabled>Loading…</button>
                 <a class="btn secondary-btn" href="https://github.com/MaxSikorski/trust-issues">View the code</a>
             </div>
         </header>
+
+        <section aria-labelledby="how-title">
+            <div class="section-label">How it works</div>
+            <h2 class="scene-title" id="how-title">Three steps, every block.</h2>
+            <div class="projects">
+                <div class="card step"><div class="card-title">1. Ask several explorers</div><div class="card-desc">Block explorers are public websites that show the Bitcoin chain. It asks a few at once.</div></div>
+                <div class="card step"><div class="card-title">2. Check the proofs</div><div class="card-desc">Blocks and transactions come with math that can be checked, so it checks it.</div></div>
+                <div class="card step"><div class="card-title">3. Agree or stop</div><div class="card-desc">If the explorers disagree, it raises an alarm instead of guessing.</div></div>
+            </div>
+            <div class="divider"></div>
+            <div class="section-label">Why it matters</div>
+            <ul class="why">
+                <li>You skip downloading the whole blockchain (hundreds of GB and days of syncing) to self-host Lightning.</li>
+                <li>Nobody holds your funds. Your node keeps its own keys.</li>
+                <li>No single company can fool your node: a lie gets caught.</li>
+            </ul>
+            <p>Today it runs on signet (Bitcoin's test network) only, with no real money. LND and Core Lightning have both run on it.</p>
+            <div class="divider"></div>
+            <p>Below, you can watch Trust Issues catch lying explorers.</p>
+        </section>
 
         <section aria-labelledby="scene-title">
             <div class="section-label" id="scene-label">Ready</div>

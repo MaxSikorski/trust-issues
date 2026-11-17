@@ -111,6 +111,11 @@ async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, SourceError> {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
+    // A slow-down needs no body. Returning before reading one means the
+    // instruction is recorded even if the caller stops waiting meanwhile.
+    if let Err(e @ SourceError::RateLimited { .. }) = classify(status, retry_after, &[]) {
+        return Err(e);
+    }
     if resp.content_length().is_some_and(|l| l as usize > MAX_BODY) {
         return Err(SourceError::Invalid("answer too large".into()));
     }
@@ -121,15 +126,45 @@ async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, SourceError> {
     if body.len() > MAX_BODY {
         return Err(SourceError::Invalid("answer too large".into()));
     }
+    classify(status, retry_after, &body)
+}
+
+fn classify(status: u16, retry_after: Option<u64>, body: &[u8]) -> Result<Vec<u8>, SourceError> {
     match status {
         // Any 2xx counts: mempool.space answers /fee-estimates with 203.
         200..=299 => Ok(body.to_vec()),
         429 => Err(SourceError::RateLimited { retry_after }),
+        // A 503 that says when to come back is asking us to slow down too
+        // (RFC 9110 section 10.2.3).
+        503 if retry_after.is_some() => Err(SourceError::RateLimited { retry_after }),
         404 => Err(SourceError::NotFound),
         s => Err(SourceError::Http {
             status: s,
-            body: clean_text(&String::from_utf8_lossy(&body)),
+            body: clean_text(&String::from_utf8_lossy(body)),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_on_a_503_is_a_rate_limit() {
+        assert!(matches!(
+            classify(503, Some(600), b""),
+            Err(SourceError::RateLimited {
+                retry_after: Some(600)
+            })
+        ));
+        assert!(matches!(
+            classify(503, None, b"busy"),
+            Err(SourceError::Http { status: 503, .. })
+        ));
+        assert!(matches!(
+            classify(429, None, b""),
+            Err(SourceError::RateLimited { retry_after: None })
+        ));
     }
 }
 

@@ -108,7 +108,7 @@ Two examples are not tests:
 | fees_combine_across_sources_and_disagreement_raises_an_alarm | Median, max when urgent, alarm above 2× |
 | a_rate_limited_source_cools_off_while_the_others_carry_on | 429 + Retry-After: no requests while cooling, back afterwards |
 
-## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (21)
+## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (29)
 | Test | Checks |
 |---|---|
 | broadcast_goes_to_every_source_and_succeeds_if_any_accepts | Every source is sent it; one acceptance is success |
@@ -127,6 +127,14 @@ Two examples are not tests:
 | old_blocks_below_the_checkpoint_are_answered_when_sources_agree | `getblockhash`, `getblockheader` and `getblock` below the checkpoint (LND's birthday search); 0 confirmations; genesis header |
 | old_blocks_fail_closed_when_sources_disagree_or_only_one_answers | Disagreement refuses and raises an alarm, which clears once they agree; one answer is never enough |
 | old_block_lookups_ask_two_sources_once_even_when_asked_twice_at_once | Two hash answers and one header per old height; concurrent requests share it |
+| a_missed_old_block_lookup_is_retried_once_after_its_backoff | A source that misses once (Tor) is asked again after its own backoff, not sooner; the lookup is answered |
+| an_old_block_lookup_is_retried_only_once_then_fails_closed | A source that misses twice: one retry, then a refusal (one answer is never enough) |
+| a_long_retry_after_is_respected_and_not_waited_out | A 10-minute `Retry-After` is honoured: no second request, and the RPC call isn't held open |
+| a_retry_after_of_exactly_the_cap_is_waited_out_then_retried | A 15 s `Retry-After` (the cap) is waited out, then the source is asked again |
+| two_of_four_is_not_a_majority_for_old_blocks | A 2-1-1 split is refused: two votes must also be more than half |
+| retries_arent_cut_short_while_an_answer_could_still_change_the_outcome | The retry round only stops early when the answers still out can't change the result (2-2 is refused, not 2-1 taken too soon) |
+| sources_that_stop_answering_dont_clear_a_disagreement_alarm | Only agreement clears the alarm, never silence |
+| not_found_for_an_old_block_is_an_answer_and_not_retried | "Not found" is an answer, not a miss: no retry |
 | a_bad_old_header_marks_its_source_and_the_honest_copy_is_used | A header that doesn't hash to the agreed block marks its source bad |
 | a_lone_dissenter_is_outvoted_for_old_blocks_but_reported | Two votes and a strict majority win; the dissent is still reported |
 | a_chain_block_offered_as_an_old_one_is_refused | A block on our proven chain can't be served as an older height |
@@ -139,4 +147,9 @@ Two examples are not tests:
 | the_cookie_is_private_from_the_start_and_replaces_a_stale_tmp | The RPC cookie is created at 0600 (never readable by others, even for a moment) and a leftover `.cookie.tmp` is replaced; cleans up after itself |
 | a_planted_symlink_at_the_tmp_name_is_never_written_through | A symlink planted at `.cookie.tmp` is replaced and the file it points at stays untouched |
 
-**Total: 97 tests.**
+## src/esplora.rs: unit test (1)
+| Test | Checks |
+|---|---|
+| retry_after_on_a_503_is_a_rate_limit | A 503 with `Retry-After` is a slow-down like a 429; a bare 503 stays a server error |
+
+**Total: 106 tests.**

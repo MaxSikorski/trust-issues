@@ -20,3 +20,6 @@ __pycache__/
 .vscode/
 *.swp
 
+
+# Your own compose override (it names your wallet folders)
+compose.override.yaml

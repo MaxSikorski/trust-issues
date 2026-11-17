@@ -6,6 +6,9 @@ FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e
 # rust-toolchain.toml pins the same compiler; naming it here stops rustup
 # trying to download extra components (rustfmt, clippy) during the build.
 ENV RUSTUP_TOOLCHAIN=1.99.1
+# Optional cap on parallel compile jobs, for a machine shared with other work:
+#   docker compose build --build-arg CARGO_BUILD_JOBS=8
+ARG CARGO_BUILD_JOBS
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

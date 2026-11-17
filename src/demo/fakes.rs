@@ -2,8 +2,9 @@
 //! withhold, rate-limit or drop broadcasts. Used by the demo and the tests.
 //! No network, no keys, no real coins.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::node::{ManualClock, Node, Settings};
 use crate::source::{FeeMap, MerkleProof, Outspend, Source, SourceError, TxStatus};
@@ -168,6 +169,27 @@ pub struct FakeState {
     pub received: Vec<String>,
     pub mempool: HashMap<Txid, Transaction>,
     pub calls: usize,
+    /// How many times `raw_block` was asked.
+    pub raw_block_calls: usize,
+    /// `raw_block` waits this long before answering (a slow download).
+    pub raw_block_delay: Option<Duration>,
+    /// How many times `header` was asked.
+    pub header_calls: usize,
+    /// `header` waits this long before answering (a slow explorer).
+    pub header_delay: Option<Duration>,
+    /// `block_hash_at` waits this long before answering.
+    pub hash_at_delay: Option<Duration>,
+    /// `raw_block` answers "not found" for these (withholding a block
+    /// while showing its header).
+    pub withheld_blocks: HashSet<BlockHash>,
+    /// `blocks[i]` is at height `height_offset + i` for `tip_height` and
+    /// `block_hash_at` (real signet blocks sit at real heights).
+    pub height_offset: u32,
+    /// `block_hash_at` answers these first (a header far below the rest).
+    pub at_height: HashMap<u32, BlockHash>,
+    /// `header` answers these by hash before looking in `blocks`: headers
+    /// below the ones it shows (or, set by a test, lies about them).
+    pub extra_headers: HashMap<BlockHash, Header>,
 }
 
 pub struct FakeSource {
@@ -246,26 +268,47 @@ impl Source for FakeSource {
 
     async fn tip_height(&self) -> Result<u32, SourceError> {
         let s = self.guard()?;
-        Ok(Self::visible_blocks(&s).len() as u32 - 1)
+        Ok(s.height_offset + Self::visible_blocks(&s).len() as u32 - 1)
     }
 
     async fn block_hash_at(&self, height: u32) -> Result<BlockHash, SourceError> {
+        let delay = self.state.lock().unwrap().hash_at_delay;
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
         if height == 0
             && let Some(g) = s.genesis_override
         {
             return Ok(g);
         }
+        if let Some(h) = s.at_height.get(&height) {
+            return Ok(*h);
+        }
+        let Some(i) = height.checked_sub(s.height_offset) else {
+            return Err(SourceError::NotFound);
+        };
         Self::visible_blocks(&s)
-            .get(height as usize)
+            .get(i as usize)
             .map(|b| b.block_hash())
             .ok_or(SourceError::NotFound)
     }
 
     async fn header(&self, hash: BlockHash) -> Result<Header, SourceError> {
+        let delay = {
+            let mut s = self.state.lock().unwrap();
+            s.header_calls += 1;
+            s.header_delay
+        };
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
         if let Some(h) = s.header_lie {
             return Ok(h);
+        }
+        if let Some(h) = s.extra_headers.get(&hash) {
+            return Ok(*h);
         }
         s.blocks
             .iter()
@@ -275,7 +318,18 @@ impl Source for FakeSource {
     }
 
     async fn raw_block(&self, hash: BlockHash) -> Result<Vec<u8>, SourceError> {
+        let delay = {
+            let mut s = self.state.lock().unwrap();
+            s.raw_block_calls += 1;
+            s.raw_block_delay
+        };
+        if let Some(d) = delay {
+            crate::time::sleep(d).await;
+        }
         let s = self.guard()?;
+        if s.withheld_blocks.contains(&hash) {
+            return Err(SourceError::NotFound);
+        }
         let mut b = s
             .blocks
             .iter()

@@ -31,6 +31,9 @@ pub struct EsploraSource {
     /// Session tag that keeps this source on its own circuit.
     session: String,
     broadcasts: AtomicU64,
+    /// Body bytes taken from this source's answers so far (a test checks
+    /// that an oversized answer stops being read near the limit).
+    body_bytes: AtomicU64,
 }
 
 fn build_client(route: &Route, isolation: &str) -> Result<reqwest::Client, String> {
@@ -78,6 +81,7 @@ impl EsploraSource {
             client: build_client(&spec.route, &session)?,
             session,
             broadcasts: AtomicU64::new(0),
+            body_bytes: AtomicU64::new(0),
         })
     }
 
@@ -88,7 +92,9 @@ impl EsploraSource {
             .send()
             .await
             .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?;
-        read_body(resp).await
+        let (result, taken) = read_body_counted(resp).await;
+        self.body_bytes.fetch_add(taken as u64, Ordering::Relaxed);
+        result
     }
 
     async fn get_text(&self, path: &str) -> Result<String, SourceError> {
@@ -104,7 +110,18 @@ impl EsploraSource {
     }
 }
 
-async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, SourceError> {
+/// Read an answer's body (at most `MAX_BODY`), and say how many body bytes
+/// it took from the connection.
+async fn read_body_counted(mut resp: reqwest::Response) -> (Result<Vec<u8>, SourceError>, usize) {
+    let mut taken = 0;
+    let result = read_body_into(&mut resp, &mut taken).await;
+    (result, taken)
+}
+
+async fn read_body_into(
+    resp: &mut reqwest::Response,
+    taken: &mut usize,
+) -> Result<Vec<u8>, SourceError> {
     let status = resp.status().as_u16();
     let retry_after = resp
         .headers()
@@ -119,12 +136,19 @@ async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, SourceError> {
     if resp.content_length().is_some_and(|l| l as usize > MAX_BODY) {
         return Err(SourceError::Invalid("answer too large".into()));
     }
-    let body = resp
-        .bytes()
+    // Read piece by piece and stop as soon as it's too big: a chunked
+    // answer has no length up front, and must not be held whole first.
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?;
-    if body.len() > MAX_BODY {
-        return Err(SourceError::Invalid("answer too large".into()));
+        .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?
+    {
+        *taken += chunk.len();
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(SourceError::Invalid("answer too large".into()));
+        }
+        body.extend_from_slice(&chunk);
     }
     classify(status, retry_after, &body)
 }
@@ -165,6 +189,74 @@ mod tests {
             classify(429, None, b""),
             Err(SourceError::RateLimited { retry_after: None })
         ));
+    }
+
+    /// A chunked answer has no length up front. A tiny HTTP server on
+    /// loopback (no network) streams 64 MiB in 64 KiB chunks; we must stop
+    /// reading soon after 8 MiB instead of holding the whole answer first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chunked_answer_is_cut_off_at_the_limit_while_streaming() {
+        use bitcoin::hashes::Hash;
+        use std::io::{Read, Write};
+
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // Never hang the test: a reader that stalls ends the stream.
+            s.set_write_timeout(Some(Duration::from_secs(20))).unwrap();
+            let mut req: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => return 0,
+                    Ok(n) => req.extend(&buf[..n]),
+                }
+            }
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if s.write_all(head.as_bytes()).is_err() {
+                return 0;
+            }
+            let chunk = vec![0u8; 64 * 1024];
+            let size = format!("{:x}\r\n", chunk.len());
+            let mut sent = 0;
+            while sent < TOTAL {
+                let ok = s.write_all(size.as_bytes()).is_ok()
+                    && s.write_all(&chunk).is_ok()
+                    && s.write_all(b"\r\n").is_ok();
+                if !ok {
+                    return sent;
+                }
+                sent += chunk.len();
+            }
+            let _ = s.write_all(b"0\r\n\r\n");
+            sent
+        });
+        let source = EsploraSource::new(&SourceSpec {
+            name: "loopback".into(),
+            url: format!("http://{addr}"),
+            route: Route::Direct,
+        })
+        .unwrap();
+        let res = source.raw_block(BlockHash::all_zeros()).await;
+        let taken = source.body_bytes.load(Ordering::Relaxed) as usize;
+        assert!(
+            matches!(&res, Err(SourceError::Invalid(m)) if m.contains("too large")),
+            "{res:?}"
+        );
+        // It stops at the first piece that crosses 8 MiB: at most one
+        // 64 KiB chunk (the server's chunk size) past the limit.
+        assert!(taken > MAX_BODY, "took {taken} bytes");
+        assert!(taken <= MAX_BODY + 64 * 1024, "took {taken} bytes");
+        drop(source);
+        // Joined off the runtime, so the client can finish hanging up.
+        let sent = tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+        // What the server got rid of: what we read plus what the kernel's
+        // socket buffers took before we hung up. Far less than all of it.
+        assert!(sent < 24 * 1024 * 1024, "server sent {sent} bytes");
     }
 }
 
@@ -307,7 +399,7 @@ impl Source for EsploraSource {
             .send()
             .await
             .map_err(|e| SourceError::Transport(error_chain(&e.without_url())))?;
-        let bytes = read_body(resp).await?;
+        let bytes = read_body_counted(resp).await.0?;
         let text = String::from_utf8_lossy(&bytes);
         parse(&text, "txid")
     }

@@ -13,22 +13,39 @@ use crate::time::Instant;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::{DisplayHex, FromHex};
+use bitcoin::pow::Work;
 use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use crate::chain::HeaderChain;
+use crate::chain::{ChainError, HeaderChain, derive_target};
 use crate::fees;
 use crate::limits::{BACKOFF_CAP, TokenBucket, backoff};
-use crate::proof::{verify_block, verify_merkle_branch, verify_tx};
+use crate::proof::{coinbase_height_is, verify_block_for, verify_merkle_branch, verify_tx};
 use crate::source::{FeeMap, Source, SourceError};
 
 /// How deep below the agreed tip a bootstrap checkpoint is taken.
 pub const BOOTSTRAP_DEPTH: u32 = 6;
 /// How far back we follow a source's tip looking for our chain.
 pub const MAX_WALK: usize = 2016;
+/// How many headers below the checkpoint each round's walk back proves at
+/// most (see [`Node::walk_back`]): 2015 take about 32 rounds.
+pub const WALK_BACK_PER_TICK: usize = 64;
+/// How long one round's walk back from the checkpoint may take, whatever
+/// the sources do. It runs before fees and broadcast rechecks in the same
+/// round, so a slow source must not hold those up. 20 s keeps a round well
+/// inside the default 60 s poll interval and is plenty for a few dozen
+/// headers from a working explorer over Tor; the rest wait for the next
+/// round (see [`Node::walk_back`]).
+pub const WALK_BACK_ROUND_LIMIT: Duration = Duration::from_secs(20);
+/// When we're more than one walk behind, how deep below our tip the
+/// source's chain may have forked from ours for a catch-up step to still
+/// connect (see [`Node::poll_tip`]). Each step starts this many blocks
+/// short of a full walk above our tip. A day of signet blocks: signet has
+/// one block signer, and its forks are a block or two deep.
+pub const CATCH_UP_OVERLAP: u32 = 144;
 /// A source must have answered within this long to count as healthy.
 pub const HEALTHY_WITHIN_SECS: u64 = 5 * 60;
 /// A source more than 2 blocks behind for this long is "lagging".
@@ -52,6 +69,13 @@ pub const MIN_AGREEING: usize = 2;
 /// before asking it once more. Longer than that (a long `Retry-After`), we
 /// fail closed instead of holding the wallet's RPC call open.
 pub const OLD_BLOCK_RETRY_MAX_WAIT: Duration = Duration::from_secs(15);
+/// How long a caller waits for someone else's download of the same block
+/// before fetching it from its own source. Long enough for a healthy
+/// download over Tor (a few seconds for a 4 MB block) to finish and be
+/// shared; short enough that one stalled explorer (its request budget,
+/// then the 90 s HTTP timeout) can't hold up a ready one, well inside
+/// LND's and Core Lightning's 60 s RPC timeouts.
+pub const IN_FLIGHT_WAIT: Duration = Duration::from_secs(10);
 
 /// Unix seconds. Injected so tests can move time deterministically.
 pub trait Clock: Send + Sync {
@@ -151,11 +175,42 @@ struct SourceState {
     behind_since: Option<u64>,
     lagging: bool,
     fees: Option<FeeMap>,
+    /// How long this source took over its last walk-back header, not
+    /// counting waits for its own request budget (see [`Node::walk_back`]).
+    #[cfg_attr(not(feature = "signet-check"), allow(dead_code))]
+    walk_took: Option<Duration>,
+    /// Walk-back headers it said it doesn't have, in a row, and when it may
+    /// be asked for one again (see [`Node::walk_back`]).
+    #[cfg_attr(not(feature = "signet-check"), allow(dead_code))]
+    walk_misses: u32,
+    #[cfg_attr(not(feature = "signet-check"), allow(dead_code))]
+    walk_retry_at: Option<Instant>,
 }
 
 struct Handle {
     source: Arc<dyn Source>,
     state: Mutex<SourceState>,
+    /// At most [`DOWNLOADS_PER_SOURCE`] block downloads from this source
+    /// at once, whatever blocks they are (see [`Node::download_turn`]).
+    downloads: [futures::lock::Mutex<()>; DOWNLOADS_PER_SOURCE],
+}
+
+/// How many block bodies we download from one source at the same time.
+pub const DOWNLOADS_PER_SOURCE: usize = 2;
+
+/// How many extra downloads of one block may run beside the first, each
+/// started only after waiting [`IN_FLIGHT_WAIT`] (see
+/// [`Node::fetch_block_from`]). Two, so two slow explorers can't hold up
+/// a third, ready one, and still at most three downloads per block.
+pub const EXTRA_DOWNLOADS_PER_BLOCK: usize = 2;
+
+/// One block's download slots: the first download, and at most
+/// [`EXTRA_DOWNLOADS_PER_BLOCK`] extra ones when the first takes longer
+/// than [`IN_FLIGHT_WAIT`] (see [`Node::fetch_block_from`]).
+#[derive(Default)]
+struct DownloadSlot {
+    first: futures::lock::Mutex<()>,
+    extras: [futures::lock::Mutex<()>; EXTRA_DOWNLOADS_PER_BLOCK],
 }
 
 struct Pending {
@@ -225,10 +280,83 @@ pub struct Node {
     /// Cleaned names of RPC methods clients asked for that we don't support
     /// (at most [`UNSUPPORTED_RPC_MAX`]); shown on `/status`.
     unsupported_rpc: Mutex<BTreeSet<String>>,
+    /// One block download per hash at a time (see [`Node::fetch_block_from`]).
+    in_flight: Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>,
+    /// Blocks refused because their signet solution can't be judged here,
+    /// with why (see [`Node::fetch_block_from`]).
+    unjudged: Mutex<HashMap<BlockHash, String>>,
+    /// Unjudgeable blocks that stopped us following a source's chain, with
+    /// the work their branch would have and why. The warning stays while
+    /// one of them could still be the best chain (see
+    /// [`Node::refresh_unjudged_alarm`]).
+    blocked_unjudged: Mutex<HashMap<BlockHash, (Work, String)>>,
+    /// The retarget height we're holding back at, if any (see
+    /// [`Node::poll_tip`]).
+    retarget_hold: Mutex<Option<u32>>,
+    /// Consensus parameters other than the network's, for tests only (see
+    /// [`Node::with_chain_params`]).
+    chain_params: Option<bitcoin::params::Params>,
+    /// One walk back from the checkpoint at a time (see [`Node::walk_back`]).
+    #[cfg_attr(not(feature = "signet-check"), allow(dead_code))]
+    walk_lock: futures::lock::Mutex<()>,
+}
+
+/// One caller's share of a block's download slot. Dropping it (normally or
+/// because the caller gave up) removes the slot once nobody else holds it,
+/// so a cancelled download leaves nothing behind.
+struct InFlightEntry<'a> {
+    map: &'a Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>,
+    hash: BlockHash,
+    slot: Option<Arc<DownloadSlot>>,
+}
+
+impl<'a> InFlightEntry<'a> {
+    fn join(map: &'a Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>, hash: BlockHash) -> Self {
+        let slot = lock(map).entry(hash).or_default().clone();
+        Self {
+            map,
+            hash,
+            slot: Some(slot),
+        }
+    }
+
+    fn slot(&self) -> &DownloadSlot {
+        self.slot.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for InFlightEntry<'_> {
+    fn drop(&mut self) {
+        // Every clone is made and dropped under the map's lock, so the
+        // count is exact: 1 means only the map holds it now.
+        let mut map = lock(self.map);
+        drop(self.slot.take());
+        if map
+            .get(&self.hash)
+            .is_some_and(|s| Arc::strong_count(s) == 1)
+        {
+            map.remove(&self.hash);
+        }
+    }
 }
 
 /// How many distinct unsupported RPC method names to remember.
 pub const UNSUPPORTED_RPC_MAX: usize = 64;
+
+/// How many unjudgeable blocks to remember (forgotten all at once past this).
+const UNJUDGED_MAX: usize = 1024;
+
+/// What fetching a block from one source came to.
+enum Fetched {
+    /// Proven to be the block (and on signet, signed); now in the cache.
+    Verified(Arc<Vec<u8>>),
+    /// The source didn't supply it (not found, down, rate-limited).
+    Missing,
+    /// The source served something provably false and is marked bad.
+    Lied,
+    /// A real copy of the block, but we can't judge its signet signature.
+    Unjudged(String),
+}
 
 /// How many below-checkpoint headers to remember.
 const DEEP_CACHE_MAX: usize = 4096;
@@ -275,6 +403,7 @@ impl Node {
             .into_iter()
             .map(|source| Handle {
                 source,
+                downloads: Default::default(),
                 state: Mutex::new(SourceState {
                     bucket: TokenBucket::new(settings.requests_per_sec, settings.burst, now_i),
                     cooling_until: None,
@@ -288,6 +417,9 @@ impl Node {
                     behind_since: None,
                     lagging: false,
                     fees: None,
+                    walk_took: None,
+                    walk_misses: 0,
+                    walk_retry_at: None,
                 }),
             })
             .collect();
@@ -308,13 +440,33 @@ impl Node {
             deep: Mutex::new(DeepHeaders::default()),
             deep_lookup: futures::lock::Mutex::new(()),
             unsupported_rpc: Mutex::new(BTreeSet::new()),
+            in_flight: Mutex::new(HashMap::new()),
+            unjudged: Mutex::new(HashMap::new()),
+            blocked_unjudged: Mutex::new(HashMap::new()),
+            retarget_hold: Mutex::new(None),
+            chain_params: None,
+            walk_lock: futures::lock::Mutex::new(()),
         }
+    }
+
+    /// Check headers with these consensus parameters instead of the
+    /// network's. For tests only: they give regtest a short retarget
+    /// interval, so the difficulty rules can be tested on blocks a test can
+    /// mine (see [`HeaderChain::with_params`]).
+    #[doc(hidden)]
+    pub fn with_chain_params(mut self, params: bitcoin::params::Params) -> Self {
+        self.chain_params = Some(params);
+        self
     }
 
     /// The block hash at a height below our checkpoint, for wallets that
     /// look up old blocks (LND's wallet searches from block 0 for its
-    /// "birthday", then rescans from there). We can't prove these link to
-    /// our chain, so we cross-check and fail closed:
+    /// "birthday", then rescans from there). Heights the walk back from
+    /// the checkpoint proved, and the one just below the lowest header we
+    /// hold (it names that block's hash), are answered from that proof and
+    /// never voted on; a source voting against it, even one whose vote
+    /// was already on its way, is marked bad. The rest we can't prove link
+    /// to our chain, so we cross-check and fail closed:
     /// - two usable sources are asked (rotating). If they agree, that's the
     ///   answer. If not, the rest are asked too, and a hash wins only with
     ///   at least two votes and a strict majority; otherwise we refuse.
@@ -324,6 +476,14 @@ impl Node {
     ///   target within the network's limit. A source serving a header that
     ///   doesn't is marked bad. (On signet that target is very easy, so the
     ///   real protection here is the two-source agreement.)
+    ///
+    /// Old headers don't get their signet signature checked here: that
+    /// needs the whole block, and LND's birthday search and rescan walk
+    /// hundreds of old heights, so it would double the requests of a lookup
+    /// that already fails closed on any disagreement. When a wallet then
+    /// asks for an old block's contents, [`Node::get_block`] does check its
+    /// signature, and a source serving one from another signet is marked
+    /// bad there.
     ///
     /// Lookups run one at a time, so a wallet rescan can't book the sources'
     /// request budget far ahead of tip polling. The tip, which Lightning's
@@ -335,11 +495,22 @@ impl Node {
                 "Block height out of range",
             ));
         }
+        // Proven from the checkpoint down (walked, or named as the parent
+        // of the lowest header we hold): never voted on.
+        let proven = self.read_chain().proven_hash_below(height);
+        if let Some(h) = proven {
+            return Ok(self.proven_answer(height, h).await);
+        }
         if let Some(h) = lock(&self.deep).hash_at(height) {
             return Ok(h);
         }
         let _one_at_a_time = self.deep_lookup.lock().await;
-        // Someone may have looked it up while we waited.
+        // Someone may have looked it up (or the walk proven it) while we
+        // waited.
+        let proven = self.read_chain().proven_hash_below(height);
+        if let Some(h) = proven {
+            return Ok(self.proven_answer(height, h).await);
+        }
         if let Some(h) = lock(&self.deep).hash_at(height) {
             return Ok(h);
         }
@@ -448,6 +619,11 @@ impl Node {
             }
         }
         answers.retain(|&(i, _)| self.usable(i, self.clock.now()));
+        // The walk back may have proven this height while we asked: then
+        // that answers it, and a vote against it is a provable lie.
+        if let Some(h) = self.refuse_votes_against_proof(height, &answers) {
+            return Ok(self.proven_answer(height, h).await);
+        }
         let votes = Self::old_block_votes(&answers);
         if votes.len() > 1 {
             let names: Vec<String> = answers.iter().map(|(i, _)| self.name(*i)).collect();
@@ -472,25 +648,12 @@ impl Node {
             };
             return Err(RpcError::new(RPC_MISC_ERROR, why));
         };
-        // The block just below the checkpoint is provable: the checkpoint
-        // header names its parent.
-        let parent_of_base = {
-            let c = self.read_chain();
-            c.hash_at(c.base_height())
-                .and_then(|b| c.header(&b))
-                .map(|h| h.prev_blockhash)
-        };
-        if height + 1 == self.read_chain().base_height()
-            && parent_of_base.is_some_and(|p| p != winner)
-        {
-            self.set_alarm(
-                "old-block-disagreement",
-                AlarmLevel::Warning,
-                format!("sources' block at height {height} isn't our checkpoint's parent"),
-            );
+        let genesis = bitcoin::constants::genesis_block(self.settings.network).block_hash();
+        if winner == genesis && height != 0 {
+            // Genesis is the block whose parent is all zeros: height 0 only.
             return Err(RpcError::new(
                 RPC_MISC_ERROR,
-                "sources' answer contradicts our checkpoint",
+                "sources gave the genesis block for a later height",
             ));
         }
         if self.read_chain().contains(&winner) {
@@ -503,7 +666,7 @@ impl Node {
         let hash = winner;
         let answers: Vec<(usize, BlockHash)> =
             answers.into_iter().filter(|(_, h)| *h == hash).collect();
-        let max_target = bitcoin::params::Params::new(self.settings.network).max_attainable_target;
+        let params = bitcoin::params::Params::new(self.settings.network);
         for &(i, _) in &answers {
             let Ok(header) = self
                 .call(i, move |s| async move { s.header(hash).await })
@@ -511,13 +674,16 @@ impl Node {
             else {
                 continue;
             };
-            let target = header.target();
-            if header.block_hash() != hash
-                || target > max_target
-                || header.validate_pow(target).is_err()
-            {
+            let pow_ok =
+                derive_target(header.bits, &params).is_some_and(|t| header.validate_pow(t).is_ok());
+            if header.block_hash() != hash || !pow_ok {
                 self.mark_bad(i, format!("served a bad header for old block {hash}"));
                 continue;
+            }
+            // Checked again just before answering: the walk goes on while
+            // we fetch.
+            if let Some(h) = self.refuse_votes_against_proof(height, &answers) {
+                return Ok(self.proven_answer(height, h).await);
             }
             lock(&self.deep).insert(height, hash, header);
             return Ok(hash);
@@ -550,9 +716,70 @@ impl Node {
         }
     }
 
+    /// If `height` is proven now (see [`HeaderChain::proven_hash_below`]),
+    /// its hash, after marking bad every source in `answers` that named
+    /// another: our checkpoint's own ancestry says otherwise, so that's a
+    /// provable lie.
+    fn refuse_votes_against_proof(
+        &self,
+        height: u32,
+        answers: &[(usize, BlockHash)],
+    ) -> Option<BlockHash> {
+        let proven = self.read_chain().proven_hash_below(height)?;
+        for &(i, h) in answers {
+            if h != proven && self.usable(i, self.clock.now()) {
+                self.mark_bad(
+                    i,
+                    format!(
+                        "named block {h} at height {height}, but our checkpoint's ancestry proves {proven}"
+                    ),
+                );
+            }
+        }
+        Some(proven)
+    }
+
+    /// Answer an old-block lookup with `hash`, proven to be at `height`.
+    /// Wallets ask for the header next, so when we don't hold it (only the
+    /// one just below the lowest header we hold), it's fetched by hash
+    /// from the first source that has it and proven by hashing it. The
+    /// hash is the answer either way.
+    async fn proven_answer(&self, height: u32, hash: BlockHash) -> BlockHash {
+        if self.deep_header(&hash).is_some() || height == 0 {
+            return hash;
+        }
+        for i in self.rotated() {
+            match self
+                .call(i, move |s| async move { s.header(hash).await })
+                .await
+            {
+                Ok(h) if h.block_hash() == hash => {
+                    lock(&self.deep).insert(height, hash, h);
+                    break;
+                }
+                Ok(_) => self.mark_bad(
+                    i,
+                    format!("served a header that doesn't hash to {hash} (height {height})"),
+                ),
+                Err(_) => {}
+            }
+        }
+        hash
+    }
+
     /// A below-checkpoint header found by [`Node::deep_hash_at`], with its height.
+    /// Headers the walk back from the checkpoint proved come first, and a
+    /// cross-checked one the walk has since proven wrong is never served.
     pub fn deep_header(&self, hash: &BlockHash) -> Option<(u32, Header)> {
-        lock(&self.deep).by_hash.get(hash).copied()
+        let chain = self.read_chain();
+        if let Some(found) = chain.walked_header(hash) {
+            return Some(found);
+        }
+        let found = lock(&self.deep).by_hash.get(hash).copied()?;
+        match chain.proven_hash_below(found.0) {
+            Some(p) if p != *hash => None,
+            _ => Some(found),
+        }
     }
 
     fn mark_progress(&self) {
@@ -767,7 +994,16 @@ impl Node {
 
     /// Check every source's network, then settle on a checkpoint. Safe to
     /// call again until it succeeds.
+    ///
+    /// A build without the `signet-check` feature (the browser demo) has no
+    /// signet signature checker, so it refuses to start on signet at all
+    /// rather than follow headers it can't check: it never becomes ready.
     pub async fn start(&self) -> Result<(), String> {
+        if self.settings.network == Network::Signet && !cfg!(feature = "signet-check") {
+            let why = "this build can't check signet block signatures (no `signet-check` feature); refusing to run on signet";
+            self.set_alarm("signet-check-missing", AlarmLevel::Critical, why.into());
+            return Err(why.into());
+        }
         let unchecked: Vec<usize> = (0..self.sources.len())
             .filter(|&i| lock(&self.sources[i].state).genesis_ok.is_none())
             .collect();
@@ -777,8 +1013,11 @@ impl Node {
             Some((h, hash)) => (h, self.fetch_checkpoint_header(h, hash).await?),
             None => self.bootstrap_checkpoint().await?,
         };
-        *self.chain.write().unwrap_or_else(|e| e.into_inner()) =
-            HeaderChain::new(self.settings.network, height, header);
+        let chain = match &self.chain_params {
+            Some(p) => HeaderChain::with_params(p.clone(), height, header),
+            None => HeaderChain::new(self.settings.network, height, header),
+        };
+        *self.chain.write().unwrap_or_else(|e| e.into_inner()) = chain;
         self.ready.store(true, Ordering::SeqCst);
         self.clear_alarm("starting");
         info!(height, hash = %header.block_hash(), "checkpoint set; following the chain from here");
@@ -797,12 +1036,25 @@ impl Node {
             }
             return Ok(genesis.header);
         }
+        if hash == genesis.block_hash() {
+            return Err(format!(
+                "the genesis block can't be the checkpoint at height {height}"
+            ));
+        }
+        let params = bitcoin::params::Params::new(self.settings.network);
         for i in self.rotated() {
             match self
                 .call(i, move |s| async move { s.header(hash).await })
                 .await
             {
-                Ok(h) if h.block_hash() == hash => return Ok(h),
+                Ok(h) if h.block_hash() == hash => {
+                    // The header is the one this hash names, so if it
+                    // misses its own target the hash itself is no block.
+                    if !derive_target(h.bits, &params).is_some_and(|t| h.validate_pow(t).is_ok()) {
+                        return Err(format!("the checkpoint {hash} fails its proof of work"));
+                    }
+                    return Ok(h);
+                }
                 Ok(_) => self.mark_bad(i, format!("served a header that doesn't hash to {hash}")),
                 Err(_) => {}
             }
@@ -857,7 +1109,22 @@ impl Node {
             return Err(format!("sources disagree about block {height}"));
         }
         let hash = first.expect("checked non-empty");
-        let header = self.fetch_checkpoint_header(height, hash).await?;
+        let header = match self.fetch_checkpoint_header(height, hash).await {
+            Ok(h) => h,
+            Err(why) => {
+                self.set_alarm(
+                    "starting",
+                    AlarmLevel::Critical,
+                    format!(
+                        "sources agree on block {height} ({hash}), but {why}; not starting from it"
+                    ),
+                );
+                return Err(why);
+            }
+        };
+        if self.settings.network == Network::Signet && height > 0 {
+            self.prove_bootstrap_block(height, hash).await?;
+        }
         warn!(
             height,
             %hash,
@@ -865,6 +1132,47 @@ impl Node {
             hashes.len()
         );
         Ok((height, header))
+    }
+
+    /// On signet, agreement isn't enough for an automatic starting point:
+    /// every signet shares one genesis block, so two explorers following
+    /// another signet would agree on a checkpoint from it. Like every block
+    /// we follow, the checkpoint's block must be proven and signed for our
+    /// signet (it then sits in the block cache, ready for `getblock`), and
+    /// its coinbase must name the height the sources gave it (BIP34): a
+    /// real block offered at the wrong height would put every later height
+    /// off. If no source can give a copy that passes, we don't start from it.
+    async fn prove_bootstrap_block(&self, height: u32, hash: BlockHash) -> Result<(), String> {
+        let mut why = "no source could supply it".to_string();
+        for i in self.rotated() {
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(raw) => {
+                    let at_height = deserialize::<bitcoin::Block>(&raw)
+                        .is_ok_and(|b| coinbase_height_is(&b, height));
+                    if at_height {
+                        return Ok(());
+                    }
+                    // The block is proven, so its height is a fact; the
+                    // sources that put it here all claimed otherwise.
+                    why = format!("its coinbase says it isn't at height {height}");
+                    break;
+                }
+                Fetched::Missing => {}
+                Fetched::Lied => why = "it isn't signed for our signet or doesn't match".into(),
+                Fetched::Unjudged(w) => {
+                    why = w;
+                    break;
+                }
+            }
+        }
+        self.set_alarm(
+            "starting",
+            AlarmLevel::Critical,
+            format!("sources agree on block {height} ({hash}), but {why}; not starting from it"),
+        );
+        Err(format!(
+            "the agreed starting block {hash} couldn't be proven: {why}"
+        ))
     }
 
     // ---------- the polling loop ----------
@@ -885,6 +1193,8 @@ impl Node {
 
         let list = self.usable_list();
         join_all(list.into_iter().map(|i| self.poll_tip(i))).await;
+        self.walk_back(WALK_BACK_PER_TICK).await;
+        self.refresh_unjudged_alarm();
         let now = self.clock.now();
         self.update_lag(now);
         self.refresh_fees_if_due(now).await;
@@ -901,36 +1211,91 @@ impl Node {
             lock(&self.sources[i].state).tip_height = Some(h);
             return;
         }
-        let mut headers = Vec::new();
-        let mut cur = tip;
-        let mut connected = false;
-        for _ in 0..MAX_WALK {
-            let Ok(hdr) = self
-                .call(i, move |s| async move { s.header(cur).await })
-                .await
-            else {
-                return;
-            };
-            if hdr.block_hash() != cur {
-                self.mark_bad(i, format!("served a header that doesn't hash to {cur}"));
-                return;
-            }
-            let parent = hdr.prev_blockhash;
-            headers.push(hdr);
-            if self.read_chain().contains(&parent) {
-                connected = true;
-                break;
-            }
-            cur = parent;
-        }
-        if !connected {
-            lock(&self.sources[i].state).last_error = Some(format!(
-                "its tip doesn't connect to our chain within {MAX_WALK} headers"
-            ));
+        // Held just below a retarget until the walk back proves its
+        // period's first header: nothing past it can be followed yet, so
+        // fetching headers up to it would only spend the source's budget.
+        let waiting = {
+            let chain = self.read_chain();
+            lock(&self.retarget_hold)
+                .is_some_and(|at| chain.tip_height() + 1 >= at && !chain.walk_back_done())
+        };
+        if waiting {
             return;
         }
-        headers.reverse();
+        let mut headers = match self.headers_to_our_chain(i, tip).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // More than one walk behind (we were held, or down, for a
+                // long time): follow the source's chain in steps instead,
+                // from the block a little less than one walk above our
+                // tip, so the walk back from it still reaches a header we
+                // know when the source's chain forked from ours up to
+                // CATCH_UP_OVERLAP blocks below our tip (a step from a
+                // full walk above stalled for good on a fork one block
+                // deep). What it names there is checked like any header;
+                // a wrong answer just doesn't connect.
+                let above = self.read_chain().tip_height() + MAX_WALK as u32 - CATCH_UP_OVERLAP;
+                let Ok(step) = self
+                    .call(i, move |s| async move { s.block_hash_at(above).await })
+                    .await
+                else {
+                    return;
+                };
+                match self.headers_to_our_chain(i, step).await {
+                    Ok(Some(h)) => h,
+                    Ok(None) => {
+                        lock(&self.sources[i].state).last_error = Some(format!(
+                            "its chain doesn't connect to ours within {MAX_WALK} headers"
+                        ));
+                        return;
+                    }
+                    Err(()) => return,
+                }
+            }
+            Err(()) => return,
+        };
         let now = self.clock.now();
+        // The cheap checks first (links, proof of work, difficulty, times),
+        // so a bad header never costs us a block download.
+        let checked = self.read_chain().check(&headers, now);
+        match checked {
+            Ok(()) => {}
+            Err(ChainError::NeedPeriodStart { height, at }) => {
+                // We can't check the retarget header exactly until the walk
+                // back reaches its period's first header: follow the
+                // headers before it, hold it back, and blame nobody.
+                self.hold_retarget(
+                    at,
+                    format!(
+                        "the retarget needs the block at height {height}, below our checkpoint, and the walk back to it (each header proven by its hash) isn't there yet"
+                    ),
+                );
+                let Some(parent) = self.read_chain().height_of(&headers[0].prev_blockhash) else {
+                    return;
+                };
+                headers.truncate(at.saturating_sub(parent + 1) as usize);
+                if headers.is_empty() {
+                    return;
+                }
+                if let Err(e) = self.read_chain().check(&headers, now) {
+                    self.mark_bad(i, e.to_string());
+                    return;
+                }
+            }
+            Err(e) => {
+                self.mark_bad(i, e.to_string());
+                return;
+            }
+        }
+        if self.settings.network == Network::Signet {
+            match self.signed_prefix(i, &headers).await {
+                Some(n) => headers.truncate(n),
+                None => return,
+            }
+            if headers.is_empty() {
+                return;
+            }
+        }
         let result = self
             .chain
             .write()
@@ -939,7 +1304,14 @@ impl Node {
         match result {
             Ok(c) => {
                 if c.new_best {
+                    // A getblock refusal is reported until the next block.
+                    self.clear_alarm("signet-unjudged-getblock");
                     let chain = self.read_chain();
+                    let hold = *lock(&self.retarget_hold);
+                    if hold.is_some_and(|at| chain.tip_height() >= at) {
+                        *lock(&self.retarget_hold) = None;
+                        self.clear_alarm("retarget-held");
+                    }
                     info!(height = chain.tip_height(), hash = %chain.tip_hash(), source = %self.name(i), "new tip");
                     if c.reorg_depth > 0 {
                         warn!(
@@ -952,6 +1324,406 @@ impl Node {
                 lock(&self.sources[i].state).tip_height = h;
             }
             Err(e) => self.mark_bad(i, e.to_string()),
+        }
+    }
+
+    /// Source `i`'s headers from `from` back to the first one whose parent
+    /// we know, oldest first: `Ok(None)` if they don't get there within
+    /// [`MAX_WALK`], `Err` if the source failed or lied (then it is
+    /// already marked bad).
+    async fn headers_to_our_chain(
+        &self,
+        i: usize,
+        from: BlockHash,
+    ) -> Result<Option<Vec<Header>>, ()> {
+        let mut headers = Vec::new();
+        let mut cur = from;
+        for _ in 0..MAX_WALK {
+            let hdr = self
+                .call(i, move |s| async move { s.header(cur).await })
+                .await
+                .map_err(|_| ())?;
+            if hdr.block_hash() != cur {
+                self.mark_bad(i, format!("served a header that doesn't hash to {cur}"));
+                return Err(());
+            }
+            let parent = hdr.prev_blockhash;
+            headers.push(hdr);
+            if self.read_chain().contains(&parent) {
+                headers.reverse();
+                return Ok(Some(headers));
+            }
+            cur = parent;
+        }
+        Ok(None)
+    }
+
+    /// Walk back from the checkpoint by up to `max` headers (see
+    /// [`HeaderChain::walk_back_next`]). Each header is fetched by its
+    /// hash, through [`Node::call`] and so the sources' budgets, from the
+    /// first usable source (rotating) that has it, and proven by hashing
+    /// it: one honest source is enough, and a source serving a header with
+    /// another hash is marked bad (the next one is asked). Genesis is
+    /// known here and never fetched. If no source has the next header
+    /// right now, the walk stops and picks up there next round.
+    ///
+    /// It runs a step at a time each round, after the tips are polled, so
+    /// it never holds up following the chain, and stops for the round
+    /// after [`WALK_BACK_ROUND_LIMIT`], so a slow source can't hold up the
+    /// fees and broadcast rechecks after it either. The source that
+    /// answered fastest last time is asked first. A source that says it
+    /// doesn't have a header isn't blamed (explorers can be missing old
+    /// headers), but isn't asked for walk headers again until a backoff
+    /// runs out (5 s, doubling to 10 minutes), so it costs a few requests
+    /// an hour at most. It costs at most 2015 answered requests once per
+    /// start, spread over the sources. Until it reaches the period's first
+    /// header, the first retarget above the checkpoint waits (see
+    /// [`Node::poll_tip`]).
+    ///
+    /// Only a network that retargets needs it, and of ours that's signet
+    /// alone, which a build without the `signet-check` feature refuses to
+    /// run on; so that build (the browser demo, on regtest) leaves it out
+    /// and stays small.
+    #[cfg(not(feature = "signet-check"))]
+    async fn walk_back(&self, _max: usize) {}
+
+    #[cfg(feature = "signet-check")]
+    async fn walk_back(&self, max: usize) {
+        let Some(_one_walk) = self.walk_lock.try_lock() else {
+            return;
+        };
+        let deadline = Instant::now() + WALK_BACK_ROUND_LIMIT;
+        for _ in 0..max {
+            let Some((height, hash)) = self.read_chain().walk_back_next() else {
+                return;
+            };
+            let header = if height == 0 {
+                bitcoin::constants::genesis_block(self.settings.network).header
+            } else {
+                let Some(h) = self.walk_header(height, hash, deadline).await else {
+                    return;
+                };
+                h
+            };
+            // Checked again under the lock: the chain may have been
+            // replaced meanwhile (then nobody is at fault).
+            let added = self
+                .chain
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_walked(header);
+            if let Err(why) = added {
+                warn!(height, error = %why, "walk back from the checkpoint stopped");
+                return;
+            }
+        }
+    }
+
+    /// The walk-back header at `height`, which must hash to `hash`, from
+    /// the first source that has it, fastest last time first; `None` if
+    /// nobody has it now or `deadline` passes (see [`Node::walk_back`]).
+    #[cfg(feature = "signet-check")]
+    async fn walk_header(&self, height: u32, hash: BlockHash, deadline: Instant) -> Option<Header> {
+        use futures::future::{Either, select};
+        let now = Instant::now();
+        let mut order: Vec<usize> = self
+            .rotated()
+            .into_iter()
+            .filter(|&i| {
+                lock(&self.sources[i].state)
+                    .walk_retry_at
+                    .is_none_or(|t| t <= now)
+            })
+            .collect();
+        // Not asked yet counts as fastest, so every source gets measured.
+        order.sort_by_key(|&i| lock(&self.sources[i].state).walk_took.unwrap_or_default());
+        for i in order {
+            let started = Instant::now();
+            let left = deadline.saturating_duration_since(started);
+            if left.is_zero() {
+                return None;
+            }
+            // Timed inside the request, so a wait for the source's own
+            // budget doesn't count against it.
+            let took_ms = AtomicU64::new(u64::MAX);
+            let took = &took_ms;
+            let fetch = self.call(i, move |s| async move {
+                let t = Instant::now();
+                let r = s.header(hash).await;
+                let ms = Instant::now().saturating_duration_since(t).as_millis();
+                took.store(ms as u64, Ordering::Relaxed);
+                r
+            });
+            let answer = if crate::time::has_timer() {
+                match select(
+                    std::pin::pin!(fetch),
+                    std::pin::pin!(crate::time::sleep(left)),
+                )
+                .await
+                {
+                    Either::Left((r, _)) => Some(r),
+                    Either::Right(_) => None,
+                }
+            } else {
+                Some(fetch.await)
+            };
+            let took = match took_ms.load(Ordering::Relaxed) {
+                u64::MAX => Instant::now().saturating_duration_since(started),
+                ms => Duration::from_millis(ms),
+            };
+            let mut st = lock(&self.sources[i].state);
+            st.walk_took = Some(took);
+            match answer {
+                // Out of time for this round; the next one goes on.
+                None => return None,
+                Some(Ok(h)) if h.block_hash() == hash => {
+                    st.walk_misses = 0;
+                    st.walk_retry_at = None;
+                    return Some(h);
+                }
+                Some(Ok(_)) => {
+                    drop(st);
+                    self.mark_bad(
+                        i,
+                        format!(
+                            "served a header that doesn't hash to {hash} (height {height}, below our checkpoint)"
+                        ),
+                    );
+                }
+                Some(Err(SourceError::NotFound)) => {
+                    st.walk_misses += 1;
+                    let wait = backoff(st.walk_misses, (self.settings.jitter)());
+                    st.walk_retry_at = Some(Instant::now() + wait);
+                }
+                Some(Err(_)) => {}
+            }
+        }
+        None
+    }
+
+    /// On signet, a header is only as good as its block's signature
+    /// (BIP325): proof of work there is cheap, and every signet shares one
+    /// genesis block, so a source following another signet could otherwise
+    /// feed us its chain. For each new header (oldest first) we fetch the
+    /// block from the source that offered it, prove it matches the header
+    /// and check its signature. The verified block goes into the block
+    /// cache, so in steady state this costs no extra requests overall: LND
+    /// and Core Lightning fetch every new block right after, and get it
+    /// from there.
+    ///
+    /// Catching up is different: every new block is fetched before its
+    /// header is followed, so a long catch-up costs about two requests per
+    /// block (its header from each source that offers it, plus one download
+    /// of the block, shared between sources). With a bootstrap checkpoint
+    /// 6 blocks down, or after a short outage, that's a handful; a node
+    /// that was off for a day re-reads about 144 blocks.
+    ///
+    /// Returns how many headers from the start are proven signed. A block
+    /// the source can't supply right now stops the run there (we connect
+    /// what's proven and try the rest next round), and so does a block
+    /// whose signature we can't judge (see [`Node::fetch_block_from`]). A
+    /// block that fails its checks is a provable lie: the source is marked
+    /// bad and `None` is returned, so none of its headers are used this
+    /// round.
+    async fn signed_prefix(&self, i: usize, headers: &[Header]) -> Option<usize> {
+        for (n, header) in headers.iter().enumerate() {
+            let hash = header.block_hash();
+            if self.read_chain().contains(&hash) {
+                // Already checked: everything in the chain went through
+                // `verify_block_for` on this network.
+                continue;
+            }
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(_) => {}
+                Fetched::Missing => return Some(n),
+                Fetched::Unjudged(why) => {
+                    // The work this block's branch would have, to tell
+                    // when our chain has gone past it: up to the best
+                    // header we know on top of it (this source's tip,
+                    // every header after it in this run), not just to it.
+                    let chain = self.read_chain();
+                    let base = chain.work_of(&headers[0].prev_blockhash);
+                    if let Some(base) = base {
+                        let work = headers.iter().fold(base, |w, h| w + h.work());
+                        let mut blocked = lock(&self.blocked_unjudged);
+                        if blocked.len() >= UNJUDGED_MAX {
+                            blocked.clear();
+                        }
+                        // Another source (or round) may know a longer branch.
+                        let work = blocked.get(&hash).map_or(work, |(w, _)| work.max(*w));
+                        blocked.insert(hash, (work, why));
+                    }
+                    return Some(n);
+                }
+                Fetched::Lied => return None,
+            }
+        }
+        Some(headers.len())
+    }
+
+    /// The warning about an unjudgeable block stays up while any block we
+    /// refused that way could still be the best chain: until our tip has
+    /// at least as much work as its branch would. A block refused again
+    /// from the cache counts again (it was recorded again).
+    fn refresh_unjudged_alarm(&self) {
+        let tip_work = self.read_chain().tip_work();
+        let mut blocked = lock(&self.blocked_unjudged);
+        blocked.retain(|_, (work, _)| *work > tip_work);
+        match blocked.values().next() {
+            Some((_, why)) => {
+                let why = why.clone();
+                drop(blocked);
+                self.set_alarm(
+                    "signet-unjudged",
+                    AlarmLevel::Warning,
+                    format!(
+                        "not following {why}; no source is blamed, since Bitcoin Core may accept it"
+                    ),
+                );
+            }
+            None => {
+                drop(blocked);
+                self.clear_alarm("signet-unjudged");
+            }
+        }
+    }
+
+    /// Hold back the retarget header at `at`, with a warning saying why.
+    /// The warning is about our best chain only: once it is past `at`, a
+    /// header someone offers there on another branch changes nothing.
+    fn hold_retarget(&self, at: u32, why: String) {
+        if self.read_chain().tip_height() >= at {
+            return;
+        }
+        *lock(&self.retarget_hold) = Some(at);
+        self.set_alarm(
+            "retarget-held",
+            AlarmLevel::Warning,
+            format!("not following past height {at} yet: {why}; no source is blamed"),
+        );
+    }
+
+    /// Get block `hash` from source `i` and prove it is that block (and, on
+    /// signet, signed for our signet) before it goes into the cache.
+    /// Usually one download per block runs at a time: sources are polled
+    /// together and usually offer the same new block, so the others wait
+    /// and then take it from the cache. They wait at most
+    /// [`IN_FLIGHT_WAIT`]; then one of them downloads it from its own
+    /// source, so a stalled explorer can't hold up a ready one. At most
+    /// [`EXTRA_DOWNLOADS_PER_BLOCK`] such extra downloads run per block
+    /// (two, so two stalled explorers can't hold up a third): everyone else
+    /// keeps waiting for whichever finishes first (2026-11-17: 20 callers
+    /// used to mean 20 downloads). Every download also needs one of its source's
+    /// [`DOWNLOADS_PER_SOURCE`] turns. A body that fails is blamed on the
+    /// source that served it, and the next caller asks its own source.
+    ///
+    /// A signet solution this checker doesn't model is refused but blamed on
+    /// nobody (Core might accept it); the callers raise the warning. It's
+    /// remembered so the block isn't downloaded again every round. That verdict belongs to the
+    /// block, not the copy: the body is proven against the header first,
+    /// and the solution is inside the coinbase the header commits to.
+    async fn fetch_block_from(&self, i: usize, hash: BlockHash) -> Fetched {
+        let entry = InFlightEntry::join(&self.in_flight, hash);
+        // Wait our turn, but not for long. Giving up drops our place in the
+        // queue (passing any wake-up on), so a stalled download holds up
+        // nobody for more than IN_FLIGHT_WAIT.
+        use futures::future::{Either, select};
+        let slot = entry.slot();
+        let _turn = if let Some(guard) = slot.first.try_lock() {
+            guard
+        } else if !crate::time::has_timer() {
+            // No clock to bound the wait by (the demo, driven by hand,
+            // where nothing stalls): wait.
+            slot.first.lock().await
+        } else {
+            let first = {
+                let turn = std::pin::pin!(slot.first.lock());
+                let timer = std::pin::pin!(crate::time::sleep(IN_FLIGHT_WAIT));
+                match select(turn, timer).await {
+                    Either::Left((guard, _)) => Some(guard),
+                    Either::Right(_) => None,
+                }
+                // Our place in the first slot's queue is dropped here,
+                // passing any wake-up on.
+            };
+            match first {
+                Some(guard) => guard,
+                // Someone else's download is taking too long: a caller
+                // gets its own copy if an extra slot is free (checked and
+                // blamed the same way); the rest wait for whichever
+                // download ends first.
+                None => match slot.extras.iter().find_map(|m| m.try_lock()) {
+                    Some(guard) => guard,
+                    None => {
+                        let all = std::iter::once(&slot.first).chain(&slot.extras);
+                        futures::future::select_all(all.map(|m| m.lock())).await.0
+                    }
+                },
+            }
+        };
+        self.fetch_block_once(i, hash).await
+        // `_turn`, then `entry`, are dropped here, in that order.
+    }
+
+    /// One of source `i`'s [`DOWNLOADS_PER_SOURCE`] download turns, waiting
+    /// for one to come free.
+    async fn download_turn(&self, i: usize) -> futures::lock::MutexGuard<'_, ()> {
+        use futures::future::{Either, select};
+        let [a, b] = &self.sources[i].downloads;
+        if let Some(guard) = a.try_lock().or_else(|| b.try_lock()) {
+            return guard;
+        }
+        match select(std::pin::pin!(a.lock()), std::pin::pin!(b.lock())).await {
+            Either::Left((guard, _)) | Either::Right((guard, _)) => guard,
+        }
+    }
+
+    /// How many block hashes have a download slot right now. For tests:
+    /// it must fall back to zero once no download is running.
+    #[doc(hidden)]
+    pub fn in_flight_len(&self) -> usize {
+        lock(&self.in_flight).len()
+    }
+
+    async fn fetch_block_once(&self, i: usize, hash: BlockHash) -> Fetched {
+        // Whoever held the slot before us may have settled it.
+        if let Some(raw) = lock(&self.blocks).get(&hash) {
+            return Fetched::Verified(raw);
+        }
+        if let Some(why) = lock(&self.unjudged).get(&hash) {
+            return Fetched::Unjudged(why.clone());
+        }
+        let _download = self.download_turn(i).await;
+        // The other download of this block may have settled it meanwhile.
+        if let Some(raw) = lock(&self.blocks).get(&hash) {
+            return Fetched::Verified(raw);
+        }
+        let Ok(raw) = self
+            .call(i, move |s| async move { s.raw_block(hash).await })
+            .await
+        else {
+            return Fetched::Missing;
+        };
+        match verify_block_for(self.settings.network, &raw, hash) {
+            Ok(_) => {
+                let raw = Arc::new(raw);
+                lock(&self.blocks).insert(hash, raw.clone());
+                Fetched::Verified(raw)
+            }
+            Err(e) if e.proves_a_lie() => {
+                self.mark_bad(i, format!("served block {hash} that fails checks: {e}"));
+                Fetched::Lied
+            }
+            Err(e) => {
+                let why = format!("block {hash}: {e}");
+                warn!(%hash, error = %e, "refusing a block we can't judge; no source blamed");
+                let mut unjudged = lock(&self.unjudged);
+                if unjudged.len() >= UNJUDGED_MAX {
+                    unjudged.clear();
+                }
+                unjudged.insert(hash, why.clone());
+                Fetched::Unjudged(why)
+            }
         }
     }
 
@@ -1123,7 +1895,9 @@ impl Node {
     /// A verified copy of a block we know the header of.
     /// A block on our chain, or an old one below the checkpoint whose header
     /// [`Node::deep_hash_at`] cross-checked. Either way the block's contents
-    /// are proven against that header (hash, merkle root, witness commitment).
+    /// are proven against that header (hash, merkle root, witness commitment)
+    /// and, on signet, its signature is checked: for old blocks that's the
+    /// only signature check they get (see [`Node::deep_hash_at`]).
     pub async fn get_block(&self, hash: BlockHash) -> Result<Arc<Vec<u8>>, RpcError> {
         if !self.read_chain().contains(&hash) && self.deep_header(&hash).is_none() {
             return Err(RpcError::new(RPC_NOT_FOUND, "Block not found"));
@@ -1132,21 +1906,20 @@ impl Node {
             return Ok(raw);
         }
         for i in self.rotated() {
-            match self
-                .call(i, move |s| async move { s.raw_block(hash).await })
-                .await
-            {
-                Ok(raw) => match verify_block(&raw, hash) {
-                    Ok(_) => {
-                        let raw = Arc::new(raw);
-                        lock(&self.blocks).insert(hash, raw.clone());
-                        return Ok(raw);
-                    }
-                    Err(e) => {
-                        self.mark_bad(i, format!("served block {hash} that fails checks: {e}"))
-                    }
-                },
-                Err(_) => continue,
+            match self.fetch_block_from(i, hash).await {
+                Fetched::Verified(raw) => return Ok(raw),
+                Fetched::Unjudged(why) => {
+                    self.set_alarm(
+                        "signet-unjudged-getblock",
+                        AlarmLevel::Warning,
+                        format!("refused to serve {why} (shown until the next new block); no source is blamed, since Bitcoin Core may accept it"),
+                    );
+                    return Err(RpcError::new(
+                        RPC_MISC_ERROR,
+                        format!("Block refused (no source blamed): {why}"),
+                    ));
+                }
+                Fetched::Missing | Fetched::Lied => continue,
             }
         }
         Err(RpcError::new(
@@ -1642,4 +2415,82 @@ fn most_common(errors: Vec<RpcError>) -> Option<RpcError> {
 /// Serialize a header to hex (for `getblockheader` with verbose=false).
 pub fn header_hex(h: &Header) -> String {
     serialize(h).to_lower_hex_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proof::verify_block_for;
+
+    fn settings(network: Network) -> Settings {
+        Settings {
+            network,
+            checkpoint: Some((0, bitcoin::constants::genesis_block(network).block_hash())),
+            fee_ceiling_sat_vb: 1000.0,
+            requests_per_sec: 2.0,
+            burst: 10.0,
+            jitter: || 0.0,
+        }
+    }
+
+    fn genesis_raw(network: Network) -> (Vec<u8>, BlockHash) {
+        let g = bitcoin::constants::genesis_block(network);
+        (serialize(&g), g.block_hash())
+    }
+
+    /// The browser build (`--no-default-features`) has no signet checker:
+    /// every signet block is refused and a node won't start on signet.
+    /// Regtest, which the demo uses, is unaffected.
+    #[cfg(not(feature = "signet-check"))]
+    #[test]
+    fn without_the_signet_check_feature_signet_is_refused() {
+        use crate::proof::ProofError;
+        use crate::signet::SignetError;
+
+        let (raw, hash) = genesis_raw(Network::Signet);
+        assert_eq!(
+            verify_block_for(Network::Signet, &raw, hash).unwrap_err(),
+            ProofError::BadSignetSignature(SignetError::NotBuilt)
+        );
+        let node = Node::new(
+            settings(Network::Signet),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        let err = futures::executor::block_on(node.start()).unwrap_err();
+        assert!(err.contains("signet-check"), "{err}");
+        futures::executor::block_on(node.tick());
+        assert!(!node.is_ready());
+        assert_eq!(
+            node.alarms()["signet-check-missing"].level,
+            AlarmLevel::Critical
+        );
+
+        let (raw, hash) = genesis_raw(Network::Regtest);
+        assert!(verify_block_for(Network::Regtest, &raw, hash).is_ok());
+        let node = Node::new(
+            settings(Network::Regtest),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        futures::executor::block_on(node.start()).expect("regtest starts");
+        assert!(node.is_ready());
+    }
+
+    /// The counterpart: with the checker built in (the real program),
+    /// signet starts and its genesis block passes.
+    #[cfg(feature = "signet-check")]
+    #[tokio::test]
+    async fn with_the_signet_check_feature_signet_runs() {
+        let (raw, hash) = genesis_raw(Network::Signet);
+        assert!(verify_block_for(Network::Signet, &raw, hash).is_ok());
+        let node = Node::new(
+            settings(Network::Signet),
+            Vec::new(),
+            Arc::new(ManualClock::new(0)),
+        );
+        node.start().await.expect("signet starts");
+        assert!(node.is_ready());
+        assert!(!node.alarms().contains_key("signet-check-missing"));
+    }
 }

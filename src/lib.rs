@@ -10,6 +10,7 @@ pub mod fees;
 pub mod limits;
 pub mod node;
 pub mod proof;
+pub mod signet;
 pub mod source;
 pub mod time;
 

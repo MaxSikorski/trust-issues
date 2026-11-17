@@ -2,7 +2,8 @@
 //!
 //! We start from a checkpoint (a block hash we trust) and only ever accept
 //! headers that link back to it, meet their own proof-of-work target, follow
-//! the difficulty rules and aren't too far in the future. When two branches
+//! the difficulty rules, aren't too far in the future and are later than
+//! the median time of the 11 blocks before them. When two branches
 //! exist we follow the one with the most work, no matter how many sources
 //! vote for the other.
 
@@ -25,6 +26,7 @@ pub enum ChainError {
     TargetAboveLimit { hash: BlockHash },
     BadDifficulty { hash: BlockHash, height: u32 },
     TimeTooNew { hash: BlockHash },
+    TimeTooOld { hash: BlockHash },
 }
 
 impl fmt::Display for ChainError {
@@ -47,6 +49,12 @@ impl fmt::Display for ChainError {
             }
             ChainError::TimeTooNew { hash } => {
                 write!(f, "header {hash} is more than two hours in the future")
+            }
+            ChainError::TimeTooOld { hash } => {
+                write!(
+                    f,
+                    "header {hash} isn't later than the median time of the 11 blocks before it"
+                )
             }
         }
     }
@@ -203,8 +211,40 @@ impl HeaderChain {
     /// already know, add them, and switch to them if they carry more work.
     /// Nothing is added unless every header passes.
     pub fn connect(&mut self, headers: &[Header], now: u64) -> Result<Connected, ChainError> {
-        let Some(first) = headers.first() else {
+        let checked = self.check_run(headers, now)?;
+        let Some((tip_hash, tip)) = checked.last().cloned() else {
             return Ok(Connected::default());
+        };
+        for (hash, entry) in checked {
+            self.entries.entry(hash).or_insert(entry);
+        }
+
+        if tip.work > self.tip_work() && !self.is_best(&tip_hash) {
+            let old_tip = self.tip_height();
+            self.rebuild_best(tip_hash);
+            let fork_height = self.fork_height_with_old(old_tip);
+            return Ok(Connected {
+                new_best: true,
+                reorg_depth: old_tip.saturating_sub(fork_height),
+            });
+        }
+        Ok(Connected::default())
+    }
+
+    /// Every check [`HeaderChain::connect`] makes, without adding anything.
+    /// Lets the node refuse bad headers before it spends requests fetching
+    /// their blocks (for signet signatures).
+    pub fn check(&self, headers: &[Header], now: u64) -> Result<(), ChainError> {
+        self.check_run(headers, now).map(|_| ())
+    }
+
+    fn check_run(
+        &self,
+        headers: &[Header],
+        now: u64,
+    ) -> Result<Vec<(BlockHash, Entry)>, ChainError> {
+        let Some(first) = headers.first() else {
+            return Ok(Vec::new());
         };
         let mut prev = self
             .entries
@@ -212,7 +252,7 @@ impl HeaderChain {
             .cloned()
             .ok_or(ChainError::UnknownParent(first.prev_blockhash))?;
 
-        let mut checked = Vec::with_capacity(headers.len());
+        let mut checked: Vec<(BlockHash, Entry)> = Vec::with_capacity(headers.len());
         for h in headers {
             let height = prev.height + 1;
             if h.prev_blockhash != prev.header.block_hash() {
@@ -229,6 +269,11 @@ impl HeaderChain {
             if u64::from(h.time) > now + MAX_FUTURE_SECS {
                 return Err(ChainError::TimeTooNew { hash });
             }
+            if let Some(mtp) = self.full_median_time_past(&prev, &checked)
+                && h.time <= mtp
+            {
+                return Err(ChainError::TimeTooOld { hash });
+            }
             let entry = Entry {
                 header: *h,
                 height,
@@ -237,22 +282,31 @@ impl HeaderChain {
             checked.push((hash, entry.clone()));
             prev = entry;
         }
+        Ok(checked)
+    }
 
-        for (hash, entry) in checked {
-            self.entries.entry(hash).or_insert(entry);
+    /// Bitcoin's median-time-past rule needs the times of the 11 blocks
+    /// ending at `prev` (fewer only near genesis, where Core uses what
+    /// exists). Just above a checkpoint we don't know 11 of them, and the
+    /// median of a shorter, more recent run can be later than the real one,
+    /// so applying the rule there could refuse an honest header. We skip it
+    /// until we know enough; proof of work and the links still apply.
+    fn full_median_time_past(&self, prev: &Entry, batch: &[(BlockHash, Entry)]) -> Option<u32> {
+        let mut times = Vec::with_capacity(11);
+        let mut cur = prev.clone();
+        loop {
+            times.push(cur.header.time);
+            if times.len() == 11 || cur.height == 0 {
+                break;
+            }
+            let parent = cur.header.prev_blockhash;
+            cur = match batch.iter().rev().find(|(h, _)| *h == parent) {
+                Some((_, e)) => e.clone(),
+                None => self.entries.get(&parent)?.clone(),
+            };
         }
-
-        let tip_hash = prev.header.block_hash();
-        if prev.work > self.tip_work() && !self.is_best(&tip_hash) {
-            let old_tip = self.tip_height();
-            self.rebuild_best(tip_hash);
-            let fork_height = self.fork_height_with_old(old_tip);
-            return Ok(Connected {
-                new_best: true,
-                reorg_depth: old_tip.saturating_sub(fork_height),
-            });
-        }
-        Ok(Connected::default())
+        times.sort_unstable();
+        Some(times[times.len() / 2])
     }
 
     fn check_difficulty(&self, prev: &Entry, h: &Header, height: u32) -> Result<(), ChainError> {

@@ -22,7 +22,7 @@ Two examples are not tests:
 | watchdog_settings_are_read_like_systemd_means_them | `WATCHDOG_USEC` halved; `WATCHDOG_PID` must be ours; bad values mean no watchdog |
 | notify_sends_one_datagram_to_the_socket | One datagram to the socket; abstract `@` sockets refused |
 
-## chain_rules.rs: the header chain (9)
+## chain_rules.rs: the header chain (11)
 | Test | Checks |
 |---|---|
 | valid_chain_extends_from_checkpoint | A valid run of headers extends the chain; heights, confirmations, next block |
@@ -34,6 +34,22 @@ Two examples are not tests:
 | rejects_unknown_parent_and_broken_links | Headers must connect to what we know and to each other |
 | switches_to_a_fork_with_more_work_and_reports_reorg_depth | The most-work branch wins; reorg depth is reported |
 | ignores_a_fork_with_less_work | A lower-work branch is kept aside, not followed |
+| rejects_header_not_later_than_the_median_of_the_last_eleven | A header's time must be later than the median of the 11 before it, inside one batch too |
+| the_median_time_rule_waits_for_eleven_known_headers_above_a_checkpoint | Skipped until 11 earlier headers are known (fewer could refuse an honest header); applies after |
+
+## signet_signatures.rs: signet block signatures, BIP325 (8)
+Real standard-signet blocks in `tests/fixtures/` (read once from a local node), plus block 331314 forged with one signature bit flipped and its proof of work ground again.
+
+| Test | Checks |
+|---|---|
+| real_signet_blocks_carry_valid_signatures | Blocks 331314 and 331301 pass; genesis needs no signature |
+| a_flipped_bit_in_the_signature_or_the_signed_header_fails | A flipped signature bit, a changed time or reordered transactions all fail |
+| a_missing_or_moved_solution_fails | No solution, one in another output or an earlier commitment, a bare header, leftover bytes, no commitment: all refused |
+| the_solution_is_judged_like_bitcoin_cores_interpreter | Equivalent scriptSigs pass; a non-empty dummy, missing dummy, loose DER, empty signature, other sighash byte or a witness fail; non-push opcodes are refused by name |
+| only_the_standard_signet_challenge_is_accepted | Any other challenge (OP_TRUE, swapped keys) is refused, saying why |
+| the_forged_fixture_is_the_real_block_with_one_bit_flipped | The forged fixture differs by one bit, commits to it honestly and meets the real target |
+| a_valid_pow_header_without_a_valid_signature_marks_its_source_bad | Fake explorers on signet: the forger is marked bad, the real block is followed, `getblock` is served from the cache with no extra requests |
+| regtest_blocks_need_no_signature | Regtest skips the check and its chains run as before |
 
 ## proofs_fees_limits.rs: proofs, fees, politeness (8)
 | Test | Checks |
@@ -167,4 +183,4 @@ Two examples are not tests:
 |---|---|
 | retry_after_on_a_503_is_a_rate_limit | A 503 with `Retry-After` is a slow-down like a 429; a bare 503 stays a server error |
 
-**Total: 121 tests.**
+**Total: 131 tests.**

@@ -4,7 +4,9 @@
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::{Hash, sha256d};
-use bitcoin::{Block, BlockHash, Transaction, TxMerkleNode, Txid};
+use bitcoin::{Block, BlockHash, Network, Transaction, TxMerkleNode, Txid};
+
+use crate::signet::{STANDARD_SIGNET_CHALLENGE, SignetError, check_block_solution};
 
 /// Why a block or transaction from a source was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,8 @@ pub enum ProofError {
     /// 64-byte transactions can be confused with merkle tree nodes (CVE-2012-2459 family).
     SuspiciousSize,
     BadMerkleProof,
+    /// On signet: the block isn't signed for our signet (BIP325).
+    BadSignetSignature(SignetError),
 }
 
 impl std::fmt::Display for ProofError {
@@ -27,6 +31,9 @@ impl std::fmt::Display for ProofError {
             ProofError::BadWitnessCommitment => "block's witness commitment doesn't match",
             ProofError::SuspiciousSize => "64-byte transaction refused",
             ProofError::BadMerkleProof => "merkle proof doesn't lead to the block's merkle root",
+            ProofError::BadSignetSignature(e) => {
+                return write!(f, "block's signet signature fails: {e}");
+            }
         };
         f.write_str(s)
     }
@@ -44,6 +51,23 @@ pub fn verify_block(raw: &[u8], expected: BlockHash) -> Result<Block, ProofError
     }
     if !block.check_witness_commitment() {
         return Err(ProofError::BadWitnessCommitment);
+    }
+    Ok(block)
+}
+
+/// [`verify_block`], plus, on signet, the block's signature (BIP325): a
+/// block from another signet, or one with grinded-out proof of work but no
+/// signer's signature, is refused. Regtest has no block signatures.
+pub fn verify_block_for(
+    network: Network,
+    raw: &[u8],
+    expected: BlockHash,
+) -> Result<Block, ProofError> {
+    let block = verify_block(raw, expected)?;
+    if network == Network::Signet {
+        let challenge = <Vec<u8> as bitcoin::hex::FromHex>::from_hex(STANDARD_SIGNET_CHALLENGE)
+            .expect("constant is hex");
+        check_block_solution(&block, &challenge).map_err(ProofError::BadSignetSignature)?;
     }
     Ok(block)
 }

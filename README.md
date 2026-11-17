@@ -42,10 +42,10 @@ We set up three fake explorers on a made-up chain: alice and bob are honest, mal
 
 You watch the real code catch each lie. There's no Tor, no network and no coins. Add `--fast` to skip the pauses. If a check ever fails to catch a lie, the demo says so and exits with an error. I'd rather it tell on itself than look good.
 
-The browser version is the same five scenes, run by the real Rust code compiled to WebAssembly (about 470 KB, no network). It lives in [`docs/`](docs/), and `docs/build.sh` rebuilds it from source.
+The browser version is the same five scenes, run by the real Rust code compiled to WebAssembly (about 1.7 MB, no network). It lives in [`docs/`](docs/), and `docs/build.sh` rebuilds it from source.
 
 ## What milestone 1 does
-- **Headers:** we follow the chain from a checkpoint and take the **valid chain with the most work** that any explorer shows. Proof of work, links, difficulty rules and timestamps are checked on every header. It's proof, not a vote: one honest explorer is enough.
+- **Headers:** we follow the chain from a checkpoint and take the **valid chain with the most work** that any explorer shows. Proof of work, links, difficulty rules and timestamps are checked on every header, and on signet each new block's signature too (BIP325), so an explorer following another signet can't feed us its chain. It's proof, not a vote: one honest explorer is enough.
 - **"Synced":** only when **at least two explorers** are healthy and the tip isn't stale.
 - **Blocks and transactions:** fetched from one explorer at a time and verified (hash, merkle root, witness commitment, txid, merkle proofs against our own headers). An explorer caught serving bad data is ignored for 24 hours, and an alarm goes off.
 - **`gettxout`:** says "unspent" only when two explorers agree *and* the funding transaction is proven confirmed. A proven spend always wins. Anything uncertain answers null, so it fails closed.
@@ -133,7 +133,7 @@ Mainnet stays off until someone outside the project has reviewed it. Even then, 
 cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo deny --locked check
 ```
 
-All 67 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
+All 116 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
 
 ## Found a problem?
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.

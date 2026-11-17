@@ -1,5 +1,6 @@
 //! The header chain accepts only headers that link, meet their proof of
-//! work, follow the difficulty rules and aren't from the far future, and it
+//! work, follow the difficulty rules, aren't from the far future and are
+//! later than the median time of the 11 blocks before them, and it
 //! follows the branch with the most work.
 
 mod common;
@@ -159,4 +160,70 @@ fn ignores_a_fork_with_less_work() {
         "kept as a side branch"
     );
     assert!(!chain.is_best(&shorter[8].block_hash()));
+}
+
+/// A regtest block on `prev` at `time` (regtest work is trivial to redo).
+fn mine_at(prev: &bitcoin::block::Header, height: u32, time: u32) -> bitcoin::Block {
+    let mut b = mine(prev, height, vec![], 7, REGTEST_BITS);
+    b.header.time = time;
+    b.header.nonce = 0;
+    while b.header.validate_pow(b.header.target()).is_err() {
+        b.header.nonce += 1;
+    }
+    b
+}
+
+#[test]
+fn rejects_header_not_later_than_the_median_of_the_last_eleven() {
+    let blocks = build_chain(20, 1);
+    let mut chain = HeaderChain::new(Network::Regtest, 0, genesis().header);
+    chain
+        .connect(&headers(&blocks, 1), now_after(&blocks))
+        .unwrap();
+    // Times rise by 600 s, so the median of blocks 10..=20 is block 15's.
+    let mtp = blocks[15].header.time;
+    assert_eq!(chain.median_time_past(&blocks[20].block_hash()), mtp);
+    let equal = mine_at(&blocks[20].header, 21, mtp);
+    let err = chain
+        .connect(&[equal.header], now_after(&blocks))
+        .unwrap_err();
+    assert!(matches!(err, ChainError::TimeTooOld { .. }), "{err:?}");
+    assert!(err.to_string().contains("median time"), "{err}");
+    // One second later is fine, even though it's before block 20's time.
+    let later = mine_at(&blocks[20].header, 21, mtp + 1);
+    chain.connect(&[later.header], now_after(&blocks)).unwrap();
+    assert_eq!(chain.tip_height(), 21);
+
+    // Inside one batch too: the times of headers earlier in the batch count,
+    // and nothing from a failing batch is kept.
+    let mut fresh = HeaderChain::new(Network::Regtest, 0, genesis().header);
+    let mut hs = headers(&blocks, 1);
+    hs.push(equal.header);
+    let err = fresh.connect(&hs, now_after(&blocks)).unwrap_err();
+    assert!(matches!(err, ChainError::TimeTooOld { .. }), "{err:?}");
+    assert_eq!(fresh.tip_height(), 0);
+}
+
+#[test]
+fn the_median_time_rule_waits_for_eleven_known_headers_above_a_checkpoint() {
+    // Just above a checkpoint we don't know the 11 earlier times, and the
+    // median of fewer, more recent ones could wrongly refuse an honest
+    // header, so the rule is skipped there.
+    let blocks = build_chain(10, 1);
+    let mut chain = HeaderChain::new(Network::Regtest, 10, blocks[10].header);
+    let early = mine_at(&blocks[10].header, 11, blocks[10].header.time - 1000);
+    chain.connect(&[early.header], now_after(&blocks)).unwrap();
+    assert_eq!(chain.tip_height(), 11);
+
+    // Once 11 headers are known (heights 10 to 20), it applies.
+    let mut chain = HeaderChain::new(Network::Regtest, 10, blocks[10].header);
+    let mut more = blocks[..=10].to_vec();
+    extend(&mut more, 10, 2);
+    chain
+        .connect(&headers(&more, 11), now_after(&more))
+        .unwrap();
+    let mtp = more[15].header.time;
+    let old = mine_at(&more[20].header, 21, mtp);
+    let err = chain.connect(&[old.header], now_after(&more)).unwrap_err();
+    assert!(matches!(err, ChainError::TimeTooOld { .. }), "{err:?}");
 }

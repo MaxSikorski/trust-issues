@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::chain::HeaderChain;
 use crate::fees;
 use crate::limits::{BACKOFF_CAP, TokenBucket, backoff};
-use crate::proof::{verify_block, verify_merkle_branch, verify_tx};
+use crate::proof::{verify_block_for, verify_merkle_branch, verify_tx};
 use crate::source::{FeeMap, Source, SourceError};
 
 /// How deep below the agreed tip a bootstrap checkpoint is taken.
@@ -324,6 +324,14 @@ impl Node {
     ///   target within the network's limit. A source serving a header that
     ///   doesn't is marked bad. (On signet that target is very easy, so the
     ///   real protection here is the two-source agreement.)
+    ///
+    /// Old headers don't get their signet signature checked here: that
+    /// needs the whole block, and LND's birthday search and rescan walk
+    /// hundreds of old heights, so it would double the requests of a lookup
+    /// that already fails closed on any disagreement. When a wallet then
+    /// asks for an old block's contents, [`Node::get_block`] does check its
+    /// signature, and a source serving one from another signet is marked
+    /// bad there.
     ///
     /// Lookups run one at a time, so a wallet rescan can't book the sources'
     /// request budget far ahead of tip polling. The tip, which Lightning's
@@ -931,6 +939,21 @@ impl Node {
         }
         headers.reverse();
         let now = self.clock.now();
+        // The cheap checks first (links, proof of work, difficulty, times),
+        // so a bad header never costs us a block download.
+        if let Err(e) = self.read_chain().check(&headers, now) {
+            self.mark_bad(i, e.to_string());
+            return;
+        }
+        if self.settings.network == Network::Signet {
+            match self.signed_prefix(i, &headers).await {
+                Some(n) => headers.truncate(n),
+                None => return,
+            }
+            if headers.is_empty() {
+                return;
+            }
+        }
         let result = self
             .chain
             .write()
@@ -953,6 +976,44 @@ impl Node {
             }
             Err(e) => self.mark_bad(i, e.to_string()),
         }
+    }
+
+    /// On signet, a header is only as good as its block's signature
+    /// (BIP325): proof of work there is cheap, and every signet shares one
+    /// genesis block, so a source following another signet could otherwise
+    /// feed us its chain. For each new header (oldest first) we fetch the
+    /// block from the source that offered it, prove it matches the header
+    /// and check its signature. The verified block goes into the block
+    /// cache, so this costs no extra requests overall: LND and Core
+    /// Lightning fetch every new block right after, and get it from there.
+    ///
+    /// Returns how many headers from the start are proven signed. A block
+    /// the source can't supply right now stops the run there (we connect
+    /// what's proven and try the rest next round). A block that fails its
+    /// checks is a provable lie: the source is marked bad and `None` is
+    /// returned, so none of its headers are used this round.
+    async fn signed_prefix(&self, i: usize, headers: &[Header]) -> Option<usize> {
+        for (n, header) in headers.iter().enumerate() {
+            let hash = header.block_hash();
+            if self.read_chain().contains(&hash) || lock(&self.blocks).get(&hash).is_some() {
+                // Already checked: everything in the chain or the cache
+                // went through `verify_block_for` on this network.
+                continue;
+            }
+            let raw = match self
+                .call(i, move |s| async move { s.raw_block(hash).await })
+                .await
+            {
+                Ok(raw) => raw,
+                Err(_) => return Some(n),
+            };
+            if let Err(e) = verify_block_for(self.settings.network, &raw, hash) {
+                self.mark_bad(i, format!("served block {hash} that fails checks: {e}"));
+                return None;
+            }
+            lock(&self.blocks).insert(hash, Arc::new(raw));
+        }
+        Some(headers.len())
     }
 
     fn read_chain(&self) -> std::sync::RwLockReadGuard<'_, HeaderChain> {
@@ -1123,7 +1184,9 @@ impl Node {
     /// A verified copy of a block we know the header of.
     /// A block on our chain, or an old one below the checkpoint whose header
     /// [`Node::deep_hash_at`] cross-checked. Either way the block's contents
-    /// are proven against that header (hash, merkle root, witness commitment).
+    /// are proven against that header (hash, merkle root, witness commitment)
+    /// and, on signet, its signature is checked: for old blocks that's the
+    /// only signature check they get (see [`Node::deep_hash_at`]).
     pub async fn get_block(&self, hash: BlockHash) -> Result<Arc<Vec<u8>>, RpcError> {
         if !self.read_chain().contains(&hash) && self.deep_header(&hash).is_none() {
             return Err(RpcError::new(RPC_NOT_FOUND, "Block not found"));
@@ -1136,7 +1199,7 @@ impl Node {
                 .call(i, move |s| async move { s.raw_block(hash).await })
                 .await
             {
-                Ok(raw) => match verify_block(&raw, hash) {
+                Ok(raw) => match verify_block_for(self.settings.network, &raw, hash) {
                     Ok(_) => {
                         let raw = Arc::new(raw);
                         lock(&self.blocks).insert(hash, raw.clone());

@@ -30,6 +30,9 @@ use crate::source::{FeeMap, Source, SourceError};
 pub const BOOTSTRAP_DEPTH: u32 = 6;
 /// How far back we follow a source's tip looking for our chain.
 pub const MAX_WALK: usize = 2016;
+/// How many headers below the checkpoint each round's walk back proves at
+/// most (see [`Node::walk_back`]): 2015 take about 32 rounds.
+pub const WALK_BACK_PER_TICK: usize = 64;
 /// A source must have answered within this long to count as healthy.
 pub const HEALTHY_WITHIN_SECS: u64 = 5 * 60;
 /// A source more than 2 blocks behind for this long is "lagging".
@@ -164,6 +167,21 @@ struct SourceState {
 struct Handle {
     source: Arc<dyn Source>,
     state: Mutex<SourceState>,
+    /// At most [`DOWNLOADS_PER_SOURCE`] block downloads from this source
+    /// at once, whatever blocks they are (see [`Node::download_turn`]).
+    downloads: [futures::lock::Mutex<()>; DOWNLOADS_PER_SOURCE],
+}
+
+/// How many block bodies we download from one source at the same time.
+pub const DOWNLOADS_PER_SOURCE: usize = 2;
+
+/// One block's download slots: the first download, and at most one extra
+/// one when the first takes longer than [`IN_FLIGHT_WAIT`] (see
+/// [`Node::fetch_block_from`]).
+#[derive(Default)]
+struct DownloadSlot {
+    first: futures::lock::Mutex<()>,
+    extra: futures::lock::Mutex<()>,
 }
 
 struct Pending {
@@ -234,7 +252,7 @@ pub struct Node {
     /// (at most [`UNSUPPORTED_RPC_MAX`]); shown on `/status`.
     unsupported_rpc: Mutex<BTreeSet<String>>,
     /// One block download per hash at a time (see [`Node::fetch_block_from`]).
-    in_flight: Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
+    in_flight: Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>,
     /// Blocks refused because their signet solution can't be judged here,
     /// with why (see [`Node::fetch_block_from`]).
     unjudged: Mutex<HashMap<BlockHash, String>>,
@@ -246,22 +264,25 @@ pub struct Node {
     /// The retarget height we're holding back at, if any (see
     /// [`Node::poll_tip`]).
     retarget_hold: Mutex<Option<u32>>,
+    /// Consensus parameters other than the network's, for tests only (see
+    /// [`Node::with_chain_params`]).
+    chain_params: Option<bitcoin::params::Params>,
+    /// One walk back from the checkpoint at a time (see [`Node::walk_back`]).
+    #[cfg_attr(not(feature = "signet-check"), allow(dead_code))]
+    walk_lock: futures::lock::Mutex<()>,
 }
 
 /// One caller's share of a block's download slot. Dropping it (normally or
 /// because the caller gave up) removes the slot once nobody else holds it,
 /// so a cancelled download leaves nothing behind.
 struct InFlightEntry<'a> {
-    map: &'a Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
+    map: &'a Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>,
     hash: BlockHash,
-    slot: Option<Arc<futures::lock::Mutex<()>>>,
+    slot: Option<Arc<DownloadSlot>>,
 }
 
 impl<'a> InFlightEntry<'a> {
-    fn join(
-        map: &'a Mutex<HashMap<BlockHash, Arc<futures::lock::Mutex<()>>>>,
-        hash: BlockHash,
-    ) -> Self {
+    fn join(map: &'a Mutex<HashMap<BlockHash, Arc<DownloadSlot>>>, hash: BlockHash) -> Self {
         let slot = lock(map).entry(hash).or_default().clone();
         Self {
             map,
@@ -270,7 +291,7 @@ impl<'a> InFlightEntry<'a> {
         }
     }
 
-    fn slot(&self) -> &futures::lock::Mutex<()> {
+    fn slot(&self) -> &DownloadSlot {
         self.slot.as_ref().expect("held until dropped")
     }
 }
@@ -353,6 +374,7 @@ impl Node {
             .into_iter()
             .map(|source| Handle {
                 source,
+                downloads: Default::default(),
                 state: Mutex::new(SourceState {
                     bucket: TokenBucket::new(settings.requests_per_sec, settings.burst, now_i),
                     cooling_until: None,
@@ -390,7 +412,19 @@ impl Node {
             unjudged: Mutex::new(HashMap::new()),
             blocked_unjudged: Mutex::new(HashMap::new()),
             retarget_hold: Mutex::new(None),
+            chain_params: None,
+            walk_lock: futures::lock::Mutex::new(()),
         }
+    }
+
+    /// Check headers with these consensus parameters instead of the
+    /// network's. For tests only: they give regtest a short retarget
+    /// interval, so the difficulty rules can be tested on blocks a test can
+    /// mine (see [`HeaderChain::with_params`]).
+    #[doc(hidden)]
+    pub fn with_chain_params(mut self, params: bitcoin::params::Params) -> Self {
+        self.chain_params = Some(params);
+        self
     }
 
     /// The block hash at a height below our checkpoint, for wallets that
@@ -424,6 +458,10 @@ impl Node {
                 RPC_INVALID_PARAMETER,
                 "Block height out of range",
             ));
+        }
+        // Proven by the walk back from the checkpoint: no vote needed.
+        if let Some(h) = self.read_chain().hash_at(height) {
+            return Ok(h);
         }
         if let Some(h) = lock(&self.deep).hash_at(height) {
             return Ok(h);
@@ -647,7 +685,11 @@ impl Node {
     }
 
     /// A below-checkpoint header found by [`Node::deep_hash_at`], with its height.
+    /// Headers the walk back from the checkpoint proved come first.
     pub fn deep_header(&self, hash: &BlockHash) -> Option<(u32, Header)> {
+        if let Some(found) = self.read_chain().walked_header(hash) {
+            return Some(found);
+        }
         lock(&self.deep).by_hash.get(hash).copied()
     }
 
@@ -882,8 +924,11 @@ impl Node {
             Some((h, hash)) => (h, self.fetch_checkpoint_header(h, hash).await?),
             None => self.bootstrap_checkpoint().await?,
         };
-        *self.chain.write().unwrap_or_else(|e| e.into_inner()) =
-            HeaderChain::new(self.settings.network, height, header);
+        let chain = match &self.chain_params {
+            Some(p) => HeaderChain::with_params(p.clone(), height, header),
+            None => HeaderChain::new(self.settings.network, height, header),
+        };
+        *self.chain.write().unwrap_or_else(|e| e.into_inner()) = chain;
         self.ready.store(true, Ordering::SeqCst);
         self.clear_alarm("starting");
         info!(height, hash = %header.block_hash(), "checkpoint set; following the chain from here");
@@ -1059,6 +1104,7 @@ impl Node {
 
         let list = self.usable_list();
         join_all(list.into_iter().map(|i| self.poll_tip(i))).await;
+        self.walk_back(WALK_BACK_PER_TICK).await;
         self.refresh_unjudged_alarm();
         let now = self.clock.now();
         self.update_lag(now);
@@ -1076,61 +1122,61 @@ impl Node {
             lock(&self.sources[i].state).tip_height = Some(h);
             return;
         }
-        let mut headers = Vec::new();
-        let mut cur = tip;
-        let mut connected = false;
-        for _ in 0..MAX_WALK {
-            let Ok(hdr) = self
-                .call(i, move |s| async move { s.header(cur).await })
-                .await
-            else {
-                return;
-            };
-            if hdr.block_hash() != cur {
-                self.mark_bad(i, format!("served a header that doesn't hash to {cur}"));
-                return;
-            }
-            let parent = hdr.prev_blockhash;
-            headers.push(hdr);
-            if self.read_chain().contains(&parent) {
-                connected = true;
-                break;
-            }
-            cur = parent;
-        }
-        if !connected {
-            lock(&self.sources[i].state).last_error = Some(format!(
-                "its tip doesn't connect to our chain within {MAX_WALK} headers"
-            ));
+        // Held just below a retarget until the walk back proves its
+        // period's first header: nothing past it can be followed yet, so
+        // fetching headers up to it would only spend the source's budget.
+        let waiting = {
+            let chain = self.read_chain();
+            lock(&self.retarget_hold)
+                .is_some_and(|at| chain.tip_height() + 1 >= at && !chain.walk_back_done())
+        };
+        if waiting {
             return;
         }
-        headers.reverse();
+        let mut headers = match self.headers_to_our_chain(i, tip).await {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                // More than one walk behind (we were held, or down, for a
+                // long time): follow the source's chain in steps instead,
+                // from the block one walk above our tip. What it names
+                // there is checked like any header; a wrong answer just
+                // doesn't connect.
+                let above = self.read_chain().tip_height() + MAX_WALK as u32;
+                let Ok(step) = self
+                    .call(i, move |s| async move { s.block_hash_at(above).await })
+                    .await
+                else {
+                    return;
+                };
+                match self.headers_to_our_chain(i, step).await {
+                    Ok(Some(h)) => h,
+                    Ok(None) => {
+                        lock(&self.sources[i].state).last_error = Some(format!(
+                            "its chain doesn't connect to ours within {MAX_WALK} headers"
+                        ));
+                        return;
+                    }
+                    Err(()) => return,
+                }
+            }
+            Err(()) => return,
+        };
         let now = self.clock.now();
         // The cheap checks first (links, proof of work, difficulty, times),
         // so a bad header never costs us a block download.
-        let mut checked = self.read_chain().check(&headers, now);
-        if let Err(ChainError::NeedPeriodStart { height, .. }) = checked
-            && self.load_period_start(height).await
-        {
-            checked = self.read_chain().check(&headers, now);
-        }
+        let checked = self.read_chain().check(&headers, now);
         match checked {
             Ok(()) => {}
-            Err(
-                ChainError::NeedPeriodStart { at, .. }
-                | ChainError::UnprovenRetarget { height: at, .. },
-            ) => {
-                // We can't check the retarget header exactly yet, or what
-                // we'd check it against isn't proven: follow the headers
-                // before it, hold it back, and blame nobody.
-                // (A missing first header was already reported, with why,
-                // by `load_period_start`.)
-                let reported = *lock(&self.retarget_hold) == Some(at);
-                if let Err(e) = &checked
-                    && (!reported || matches!(e, ChainError::UnprovenRetarget { .. }))
-                {
-                    self.hold_retarget(at, e.to_string());
-                }
+            Err(ChainError::NeedPeriodStart { height, at }) => {
+                // We can't check the retarget header exactly until the walk
+                // back reaches its period's first header: follow the
+                // headers before it, hold it back, and blame nobody.
+                self.hold_retarget(
+                    at,
+                    format!(
+                        "the retarget needs the block at height {height}, below our checkpoint, and the walk back to it (each header proven by its hash) isn't there yet"
+                    ),
+                );
                 let Some(parent) = self.read_chain().height_of(&headers[0].prev_blockhash) else {
                     return;
                 };
@@ -1188,6 +1234,109 @@ impl Node {
         }
     }
 
+    /// Source `i`'s headers from `from` back to the first one whose parent
+    /// we know, oldest first: `Ok(None)` if they don't get there within
+    /// [`MAX_WALK`], `Err` if the source failed or lied (then it is
+    /// already marked bad).
+    async fn headers_to_our_chain(
+        &self,
+        i: usize,
+        from: BlockHash,
+    ) -> Result<Option<Vec<Header>>, ()> {
+        let mut headers = Vec::new();
+        let mut cur = from;
+        for _ in 0..MAX_WALK {
+            let hdr = self
+                .call(i, move |s| async move { s.header(cur).await })
+                .await
+                .map_err(|_| ())?;
+            if hdr.block_hash() != cur {
+                self.mark_bad(i, format!("served a header that doesn't hash to {cur}"));
+                return Err(());
+            }
+            let parent = hdr.prev_blockhash;
+            headers.push(hdr);
+            if self.read_chain().contains(&parent) {
+                headers.reverse();
+                return Ok(Some(headers));
+            }
+            cur = parent;
+        }
+        Ok(None)
+    }
+
+    /// Walk back from the checkpoint by up to `max` headers (see
+    /// [`HeaderChain::walk_back_next`]). Each header is fetched by its
+    /// hash, through [`Node::call`] and so the sources' budgets, from the
+    /// first usable source (rotating) that has it, and proven by hashing
+    /// it: one honest source is enough, and a source serving a header with
+    /// another hash is marked bad (the next one is asked). Genesis is
+    /// known here and never fetched. If no source has the next header
+    /// right now, the walk stops and picks up there next round.
+    ///
+    /// It runs a step at a time each round, after the tips are polled, so
+    /// it never holds up following the chain. It costs at most 2015
+    /// requests once per start, spread over the sources. Until it reaches
+    /// the period's first header, the first retarget above the checkpoint
+    /// waits (see [`Node::poll_tip`]).
+    ///
+    /// Only a network that retargets needs it, and of ours that's signet
+    /// alone, which a build without the `signet-check` feature refuses to
+    /// run on; so that build (the browser demo, on regtest) leaves it out
+    /// and stays small.
+    #[cfg(not(feature = "signet-check"))]
+    async fn walk_back(&self, _max: usize) {}
+
+    #[cfg(feature = "signet-check")]
+    async fn walk_back(&self, max: usize) {
+        let Some(_one_walk) = self.walk_lock.try_lock() else {
+            return;
+        };
+        for _ in 0..max {
+            let Some((height, hash)) = self.read_chain().walk_back_next() else {
+                return;
+            };
+            let header = if height == 0 {
+                bitcoin::constants::genesis_block(self.settings.network).header
+            } else {
+                let mut found = None;
+                for i in self.rotated() {
+                    match self
+                        .call(i, move |s| async move { s.header(hash).await })
+                        .await
+                    {
+                        Ok(h) if h.block_hash() == hash => {
+                            found = Some(h);
+                            break;
+                        }
+                        Ok(_) => self.mark_bad(
+                            i,
+                            format!(
+                                "served a header that doesn't hash to {hash} (height {height}, below our checkpoint)"
+                            ),
+                        ),
+                        Err(_) => {}
+                    }
+                }
+                let Some(h) = found else {
+                    return;
+                };
+                h
+            };
+            // Checked again under the lock: the chain may have been
+            // replaced meanwhile (then nobody is at fault).
+            let added = self
+                .chain
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .add_walked(header);
+            if let Err(why) = added {
+                warn!(height, error = %why, "walk back from the checkpoint stopped");
+                return;
+            }
+        }
+    }
+
     /// On signet, a header is only as good as its block's signature
     /// (BIP325): proof of work there is cheap, and every signet shares one
     /// genesis block, so a source following another signet could otherwise
@@ -1225,15 +1374,19 @@ impl Node {
                 Fetched::Missing => return Some(n),
                 Fetched::Unjudged(why) => {
                     // The work this block's branch would have, to tell
-                    // when our chain has gone past it.
+                    // when our chain has gone past it: up to the best
+                    // header we know on top of it (this source's tip,
+                    // every header after it in this run), not just to it.
                     let chain = self.read_chain();
                     let base = chain.work_of(&headers[0].prev_blockhash);
                     if let Some(base) = base {
-                        let work = headers[..=n].iter().fold(base, |w, h| w + h.work());
+                        let work = headers.iter().fold(base, |w, h| w + h.work());
                         let mut blocked = lock(&self.blocked_unjudged);
                         if blocked.len() >= UNJUDGED_MAX {
                             blocked.clear();
                         }
+                        // Another source (or round) may know a longer branch.
+                        let work = blocked.get(&hash).map_or(work, |(w, _)| work.max(*w));
                         blocked.insert(hash, (work, why));
                     }
                     return Some(n);
@@ -1271,48 +1424,13 @@ impl Node {
         }
     }
 
-    /// Get the first header of the checkpoint's retarget period from two
-    /// agreeing sources (the old-block path: cross-checked, its proof of
-    /// work checked) and give it to the chain. False if that isn't
-    /// possible right now; the retarget header then waits.
-    ///
-    /// Only signet retargets among the networks we run on (regtest never
-    /// does), and a build without the `signet-check` feature won't run on
-    /// signet, so that build never gets here; it leaves the old-block
-    /// lookup out, which keeps the browser demo small.
-    async fn load_period_start(&self, height: u32) -> bool {
-        #[cfg(feature = "signet-check")]
-        let found = match self.deep_hash_at(height).await {
-            Ok(hash) => self
-                .deep_header(&hash)
-                .ok_or_else(|| "its header wasn't kept".to_string()),
-            Err(e) => Err(e.message),
-        };
-        #[cfg(not(feature = "signet-check"))]
-        let found: Result<(u32, Header), String> =
-            Err("this build doesn't look up old blocks for retargets".into());
-        let added = found.and_then(|(_, header)| {
-            self.chain
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .add_period_start(height, header)
-        });
-        match added {
-            Ok(()) => true,
-            Err(why) => {
-                warn!(height, error = %why, "can't get the retarget period's first header yet");
-                self.hold_retarget(
-                    height + bitcoin::params::Params::new(self.settings.network)
-                        .difficulty_adjustment_interval() as u32,
-                    format!("the retarget needs the block at height {height} (below our checkpoint) and {why}"),
-                );
-                false
-            }
-        }
-    }
-
     /// Hold back the retarget header at `at`, with a warning saying why.
+    /// The warning is about our best chain only: once it is past `at`, a
+    /// header someone offers there on another branch changes nothing.
     fn hold_retarget(&self, at: u32, why: String) {
+        if self.read_chain().tip_height() >= at {
+            return;
+        }
         *lock(&self.retarget_hold) = Some(at);
         self.set_alarm(
             "retarget-held",
@@ -1326,10 +1444,13 @@ impl Node {
     /// Usually one download per block runs at a time: sources are polled
     /// together and usually offer the same new block, so the others wait
     /// and then take it from the cache. They wait at most
-    /// [`IN_FLIGHT_WAIT`], then download it from their own source (once),
-    /// so a stalled explorer can't hold up a ready one. A body that fails
-    /// is blamed on the source that served it, and the next caller asks its
-    /// own source.
+    /// [`IN_FLIGHT_WAIT`]; then one of them downloads it from its own
+    /// source, so a stalled explorer can't hold up a ready one. Only one
+    /// such extra download runs per block: everyone else keeps waiting for
+    /// whichever of the two finishes first (2026-11-17: 20 callers used to
+    /// mean 20 downloads). Every download also needs one of its source's
+    /// [`DOWNLOADS_PER_SOURCE`] turns. A body that fails is blamed on the
+    /// source that served it, and the next caller asks its own source.
     ///
     /// A signet solution this checker doesn't model is refused but blamed on
     /// nobody (Core might accept it); the callers raise the warning. It's
@@ -1341,24 +1462,45 @@ impl Node {
         // Wait our turn, but not for long. Giving up drops our place in the
         // queue (passing any wake-up on), so a stalled download holds up
         // nobody for more than IN_FLIGHT_WAIT.
-        let _turn = if let Some(guard) = entry.slot().try_lock() {
-            Some(guard)
+        use futures::future::{Either, select};
+        let slot = entry.slot();
+        let _turn = if let Some(guard) = slot.first.try_lock() {
+            guard
         } else if !crate::time::has_timer() {
             // No clock to bound the wait by (the demo, driven by hand,
             // where nothing stalls): wait.
-            Some(entry.slot().lock().await)
+            slot.first.lock().await
         } else {
-            let turn = std::pin::pin!(entry.slot().lock());
+            let turn = std::pin::pin!(slot.first.lock());
             let timer = std::pin::pin!(crate::time::sleep(IN_FLIGHT_WAIT));
-            match futures::future::select(turn, timer).await {
-                futures::future::Either::Left((guard, _)) => Some(guard),
-                // Someone else's download is taking too long: we get our
-                // own copy (one download, checked and blamed the same way).
-                futures::future::Either::Right(_) => None,
+            match select(turn, timer).await {
+                Either::Left((guard, _)) => guard,
+                // Someone else's download is taking too long: one caller
+                // gets its own copy (checked and blamed the same way); the
+                // rest wait for whichever download ends first.
+                Either::Right((_, turn)) => match slot.extra.try_lock() {
+                    Some(guard) => guard,
+                    None => match select(turn, std::pin::pin!(slot.extra.lock())).await {
+                        Either::Left((guard, _)) | Either::Right((guard, _)) => guard,
+                    },
+                },
             }
         };
         self.fetch_block_once(i, hash).await
         // `_turn`, then `entry`, are dropped here, in that order.
+    }
+
+    /// One of source `i`'s [`DOWNLOADS_PER_SOURCE`] download turns, waiting
+    /// for one to come free.
+    async fn download_turn(&self, i: usize) -> futures::lock::MutexGuard<'_, ()> {
+        use futures::future::{Either, select};
+        let [a, b] = &self.sources[i].downloads;
+        if let Some(guard) = a.try_lock().or_else(|| b.try_lock()) {
+            return guard;
+        }
+        match select(std::pin::pin!(a.lock()), std::pin::pin!(b.lock())).await {
+            Either::Left((guard, _)) | Either::Right((guard, _)) => guard,
+        }
     }
 
     /// How many block hashes have a download slot right now. For tests:
@@ -1375,6 +1517,11 @@ impl Node {
         }
         if let Some(why) = lock(&self.unjudged).get(&hash) {
             return Fetched::Unjudged(why.clone());
+        }
+        let _download = self.download_turn(i).await;
+        // The other download of this block may have settled it meanwhile.
+        if let Some(raw) = lock(&self.blocks).get(&hash) {
+            return Fetched::Verified(raw);
         }
         let Ok(raw) = self
             .call(i, move |s| async move { s.raw_block(hash).await })

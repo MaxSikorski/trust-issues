@@ -181,6 +181,9 @@ pub struct FakeState {
     pub height_offset: u32,
     /// `block_hash_at` answers these first (a header far below the rest).
     pub at_height: HashMap<u32, BlockHash>,
+    /// `header` answers these by hash before looking in `blocks`: headers
+    /// below the ones it shows (or, set by a test, lies about them).
+    pub extra_headers: HashMap<BlockHash, Header>,
 }
 
 pub struct FakeSource {
@@ -285,6 +288,9 @@ impl Source for FakeSource {
         let s = self.guard()?;
         if let Some(h) = s.header_lie {
             return Ok(h);
+        }
+        if let Some(h) = s.extra_headers.get(&hash) {
+            return Ok(*h);
         }
         s.blocks
             .iter()

@@ -955,8 +955,9 @@ async fn a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_with
     );
     node.start().await.expect("start");
 
-    // Neither explorer can say which block is at 328608 (the period's
-    // first): the retarget header isn't followed, and nobody is blamed.
+    // Neither explorer has the headers below the checkpoint, so the walk
+    // back can't reach 328608 (the period's first): the retarget header
+    // isn't followed, and nobody is blamed.
     node.tick().await;
     assert_eq!(node.with_chain(|c| c.tip_height()), 330_623);
     let alarms = node.alarms();
@@ -971,14 +972,20 @@ async fn a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_with
         "{alarms:?}"
     );
 
-    // Once two agree on it, the exact retarget is checked and followed.
+    // Once they serve them, the walk proves each by its hash down to
+    // 328608; then the exact retarget is checked and followed.
+    let hs = period_headers();
+    assert_eq!(hs[0], h608);
     for s in [&a, &b] {
         s.with(|st| {
-            st.at_height.insert(328_608, h608.block_hash());
+            st.extra_headers = hs[..2015].iter().map(|h| (h.block_hash(), *h)).collect();
         });
     }
-    node.tick().await;
-    assert_eq!(node.with_chain(|c| c.tip_hash()), b624.block_hash());
+    let followed = tick_until(&node, 60, |n| {
+        n.with_chain(|c| c.tip_hash()) == b624.block_hash()
+    })
+    .await;
+    assert!(followed, "{:?}", node.alarms());
     let alarms = node.alarms();
     assert!(
         !alarms.values().any(|a| a.message.contains("328608")),
@@ -1209,5 +1216,280 @@ async fn a_cancelled_download_leaves_no_slot_behind() {
             .is_err()
     );
     assert!(holder.await.unwrap().is_ok());
+    assert_eq!(node.in_flight_len(), 0);
+}
+
+// ---------- third review (2026-11-17) ----------
+//
+// More fixtures, also real standard-signet data:
+// - `signet-328608-to-330623-headers.bin`: every header of the retarget
+//   period 328608..330623, oldest first, 80 bytes each (read from an
+//   explorer's Esplora API, each checked against its hash and its parent);
+// - `signet-331315-on-nop-header.hex`: a header on top of the OP_NOP block
+//   331314 (merkle root all zeros, its nonce ground to meet the real
+//   target), a second block on that refused branch.
+
+/// Real signet headers 328608..330623, oldest first.
+fn period_headers() -> Vec<bitcoin::block::Header> {
+    include_bytes!("fixtures/signet-328608-to-330623-headers.bin")
+        .chunks(80)
+        .map(|c| deserialize(c).unwrap())
+        .collect()
+}
+
+/// A fake signet explorer showing the checkpoint 330623 and then `next`.
+/// Like a real one, it also serves the 2015 headers below the checkpoint
+/// (328608..330622) by hash.
+fn period_source(name: &str, next: &[Block]) -> Arc<FakeSource> {
+    let hs = period_headers();
+    let mut blocks = vec![header_only(hs[2015])];
+    blocks.extend(next.iter().cloned());
+    let s = signet_source_at(name, 330_623, &blocks);
+    s.with(|st| {
+        st.extra_headers = hs[..2015].iter().map(|h| (h.block_hash(), *h)).collect();
+    });
+    s
+}
+
+fn b624() -> Block {
+    hex_block(include_str!("fixtures/signet-330624-block.hex"))
+}
+
+/// Tick until `done` holds, at most `ticks` times; whether it came to hold.
+async fn tick_until(node: &Node, ticks: usize, done: impl Fn(&Node) -> bool) -> bool {
+    for _ in 0..ticks {
+        if done(node) {
+            return true;
+        }
+        node.tick().await;
+    }
+    done(node)
+}
+
+fn bad_sources(node: &Node) -> Vec<String> {
+    node.alarms()
+        .keys()
+        .filter(|k| k.starts_with("source-bad:"))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn one_honest_explorer_is_enough_to_prove_the_periods_first_header() {
+    let b624 = b624();
+    let s = period_source("only", std::slice::from_ref(&b624));
+    let node = signet_node(
+        std::slice::from_ref(&s),
+        (330_623, period_headers()[2015].block_hash()),
+        b624.header.time,
+    );
+    node.start().await.expect("start");
+    // d2097ae needed two explorers to vote on the block at 328608, so with
+    // one it held the retarget forever. Walking back by hash needs one.
+    let followed = tick_until(&node, 60, |n| {
+        n.with_chain(|c| c.tip_hash()) == b624.block_hash()
+    })
+    .await;
+    assert!(followed, "{:?}", node.alarms());
+    assert!(bad_sources(&node).is_empty(), "{:?}", node.alarms());
+    assert!(!node.alarms().contains_key("retarget-held"));
+}
+
+#[tokio::test]
+async fn an_explorer_lying_about_a_walked_header_is_caught_and_the_walk_goes_on() {
+    let b624 = b624();
+    let hs = period_headers();
+    let liar = period_source("liar", std::slice::from_ref(&b624));
+    // Every header it serves below the checkpoint is a real one, from
+    // another height: right proof of work, right bits, wrong hash.
+    liar.with(|st| {
+        st.extra_headers = (0..2015)
+            .map(|i| (hs[i].block_hash(), hs[(i + 1) % 2015]))
+            .collect();
+    });
+    let honest = period_source("honest", std::slice::from_ref(&b624));
+    let node = signet_node(
+        &[liar.clone(), honest.clone()],
+        (330_623, hs[2015].block_hash()),
+        b624.header.time,
+    );
+    node.start().await.expect("start");
+    let followed = tick_until(&node, 60, |n| {
+        n.with_chain(|c| c.tip_hash()) == b624.block_hash()
+    })
+    .await;
+    assert!(followed, "{:?}", node.alarms());
+    assert_eq!(bad_sources(&node), vec!["source-bad:liar".to_string()]);
+    assert!(
+        node.alarms()["source-bad:liar"]
+            .message
+            .contains("doesn't hash to"),
+        "{:?}",
+        node.alarms()
+    );
+}
+
+#[tokio::test]
+async fn two_explorers_agreeing_on_a_wrong_period_start_change_nothing() {
+    let b624 = b624();
+    let hs = period_headers();
+    // Both name 330622 (same period: valid proof of work and the same
+    // bits) as the block at 328608. d2097ae took that vote, computed the
+    // wrong target for 330624 and held the honest chain back for good.
+    let make = |name: &str| {
+        let s = period_source(name, std::slice::from_ref(&b624));
+        s.with(|st| {
+            st.at_height.insert(328_608, hs[2014].block_hash());
+        });
+        s
+    };
+    let (a, b) = (make("a"), make("b"));
+    let node = signet_node(&[a, b], (330_623, hs[2015].block_hash()), b624.header.time);
+    node.start().await.expect("start");
+    let followed = tick_until(&node, 60, |n| {
+        n.with_chain(|c| c.tip_hash()) == b624.block_hash()
+    })
+    .await;
+    assert!(followed, "{:?}", node.alarms());
+    assert!(bad_sources(&node).is_empty(), "{:?}", node.alarms());
+    assert!(!node.alarms().contains_key("retarget-held"));
+}
+
+#[tokio::test]
+async fn a_wrong_bits_sibling_after_the_retarget_doesnt_reopen_the_hold() {
+    let b624 = b624();
+    let hs = period_headers();
+    let make = |name: &str| {
+        let s = period_source(name, std::slice::from_ref(&b624));
+        // (d2097ae found the period's first header by this vote.)
+        s.with(|st| {
+            st.at_height.insert(328_608, hs[0].block_hash());
+        });
+        s
+    };
+    let (a, b, sib) = (make("a"), make("b"), make("sib"));
+    let node = signet_node(
+        &[a, b, sib.clone()],
+        (330_623, hs[2015].block_hash()),
+        b624.header.time,
+    );
+    node.start().await.expect("start");
+    let followed = tick_until(&node, 60, |n| {
+        n.with_chain(|c| c.tip_hash()) == b624.block_hash()
+    })
+    .await;
+    assert!(followed, "{:?}", node.alarms());
+    assert!(!node.alarms().contains_key("retarget-held"));
+
+    // One explorer now offers a sibling of 330624 one unit harder than
+    // Core computes (the bits are checked before the proof of work).
+    let mut sibling = b624.header;
+    sibling.bits = bitcoin::CompactTarget::from_consensus(0x1d14_fced);
+    sib.set_chain(&[header_only(hs[2015]), header_only(sibling)]);
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), b624.block_hash());
+    // Our best chain is past the retarget: nothing is held.
+    assert!(
+        !node.alarms().contains_key("retarget-held"),
+        "{:?}",
+        node.alarms()
+    );
+}
+
+#[tokio::test]
+async fn the_unsupported_solution_warning_counts_the_whole_competing_branch() {
+    let h312 = header_hex(include_str!("fixtures/signet-331312-header.hex"));
+    let b313 = hex_block(include_str!("fixtures/signet-331313-block.hex"));
+    let nop = nop_314();
+    let child = header_hex(include_str!("fixtures/signet-331315-on-nop-header.hex"));
+    assert_eq!(child.prev_blockhash, nop.block_hash());
+    assert!(child.validate_pow(child.target()).is_ok());
+    let make = |name: &str| {
+        signet_source_at(
+            name,
+            331_312,
+            &[
+                header_only(h312),
+                b313.clone(),
+                nop.clone(),
+                header_only(child),
+            ],
+        )
+    };
+    let (a, b) = (make("a"), make("b"));
+    let node = signet_node(
+        &[a.clone(), b.clone()],
+        (331_312, h312.block_hash()),
+        child.time,
+    );
+    node.start().await.expect("start");
+    let unjudged = |node: &Node| node.alarms().contains_key("signet-unjudged");
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), b313.block_hash());
+    assert!(unjudged(&node), "{:?}", node.alarms());
+
+    // The real 331314 has as much work as the refused block, but the
+    // refused branch already shows a block after it: it could still be
+    // the best chain, so the warning stays (d2097ae cleared it).
+    for s in [&a, &b] {
+        s.set_chain(&[header_only(h312), b313.clone(), block_314()]);
+    }
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_hash()), block_314().block_hash());
+    assert!(unjudged(&node), "{:?}", node.alarms());
+    assert!(bad_sources(&node).is_empty(), "{:?}", node.alarms());
+}
+
+#[tokio::test(start_paused = true)]
+async fn many_waiting_callers_start_at_most_one_extra_download() {
+    let blocks = build_chain(3, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let (node, _) = started_node(std::slice::from_ref(&a), &blocks).await;
+    a.with(|st| {
+        st.raw_block_calls = 0;
+        st.raw_block_delay = Some(std::time::Duration::from_secs(15));
+    });
+    let hash = blocks[2].block_hash();
+    let calls: Vec<_> = (0..20)
+        .map(|_| {
+            let n = node.clone();
+            tokio::spawn(async move { n.get_block(hash).await })
+        })
+        .collect();
+    for c in calls {
+        assert!(c.await.unwrap().is_ok());
+    }
+    // The first download, and one fallback after IN_FLIGHT_WAIT; the
+    // other 18 waited for whichever finished (d2097ae: 20 downloads).
+    assert!(
+        a.with(|s| s.raw_block_calls) <= 2,
+        "{}",
+        a.with(|s| s.raw_block_calls)
+    );
+    assert_eq!(node.in_flight_len(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_explorer_gets_at_most_two_block_downloads_at_once() {
+    let blocks = build_chain(20, 1);
+    let a = FakeSource::honest("a", &blocks);
+    let (node, _) = started_node(std::slice::from_ref(&a), &blocks).await;
+    a.with(|st| {
+        st.raw_block_calls = 0;
+        st.raw_block_delay = Some(std::time::Duration::from_secs(15));
+    });
+    let calls: Vec<_> = (1..=20)
+        .map(|h| {
+            let n = node.clone();
+            let hash = blocks[h].block_hash();
+            tokio::spawn(async move { n.get_block(hash).await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(a.with(|s| s.raw_block_calls), 2);
+    for c in calls {
+        assert!(c.await.unwrap().is_ok());
+    }
+    assert_eq!(a.with(|s| s.raw_block_calls), 20);
     assert_eq!(node.in_flight_len(), 0);
 }

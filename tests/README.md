@@ -22,7 +22,7 @@ Two examples are not tests:
 | watchdog_settings_are_read_like_systemd_means_them | `WATCHDOG_USEC` halved; `WATCHDOG_PID` must be ours; bad values mean no watchdog |
 | notify_sends_one_datagram_to_the_socket | One datagram to the socket; abstract `@` sockets refused |
 
-## chain_rules.rs: the header chain (17)
+## chain_rules.rs: the header chain (20)
 | Test | Checks |
 |---|---|
 | valid_chain_extends_from_checkpoint | A valid run of headers extends the chain; heights, confirmations, next block |
@@ -37,14 +37,17 @@ Two examples are not tests:
 | rejects_header_not_later_than_the_median_of_the_last_eleven | A header's time must be later than the median of the 11 before it, inside one batch too |
 | the_median_time_rule_waits_for_eleven_known_headers_above_a_checkpoint | Skipped until 11 earlier headers are known (fewer could refuse an honest header); applies after |
 | at_a_retarget_the_bits_must_be_exactly_what_core_computes | With a 4-block test interval: at a retarget only Core's exact `bits` pass (one unit harder or easier, or unchanged, is refused); between retargets nothing may change |
-| an_honest_four_times_harder_retarget_survives_compact_rounding | A 4x-harder retarget that rounds just under a strict quarter is accepted, with the period known and from a checkpoint inside it (the period's first header given separately); one unit harder is refused |
+| an_honest_four_times_harder_retarget_survives_compact_rounding | A 4x-harder retarget that rounds just under a strict quarter is accepted, with the period known and from a checkpoint inside it (the headers below it walked back by hash); one unit harder is refused |
 | the_retarget_matches_real_signet_and_cores_rounding | Real signet block 330624 (0x1d14cd85 to 0x1d14fcee) computed exactly; 0x1d14fcee to 0x1d053f3b; time running backwards; the cap at signet's limit |
-| a_retarget_just_above_a_checkpoint_needs_the_periods_first_header | From a checkpoint inside a period, no retarget passes until the period's first header is given (one unit harder passed Core's permitted range on 5f78d99); a wrong first header is refused; then only the exact bits pass |
+| a_retarget_just_above_a_checkpoint_needs_the_periods_first_header | From a checkpoint inside a period, no retarget passes until the walk back reaches the period's first header (one unit harder passed Core's permitted range on 5f78d99); the walk takes only the header with the hash it asked for, not one from another height or with other bits; part of the way isn't enough; then a wrong retarget is a provable lie and only the exact bits pass |
 | bits_that_overflow_or_go_negative_are_refused_like_core | Core's `SetCompact` rules (negative, zero, overflow) on a table of `bits`; an overflowing 0x3f3fffff that wraps to the expected target is refused at a retarget (5f78d99 took it) |
-| the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period | Real headers 330623, 328608 and 330624: waits for 328608, then 0x1d14fced and 0x3d14fcee are refused and the real header is followed |
+| the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period | Real headers 330623 to 330624: waits for 328608, then walks back through the 2015 real headers below 330623, each proven by hash (only those kept; nothing below 328608 answered); then 0x1d14fced is a difficulty violation, 0x3d14fcee is refused and the real header is followed |
+| a_checkpoint_just_below_the_first_retarget_needs_no_vote_on_genesis | Regtest with a 16-block retarget: checkpoint at 15, one of two explorers down: the walk proves 14 to 1 from the other and takes genesis from what we know, and 16 to 20 are followed (d2097ae asked two explorers to vote on genesis and stopped at 15) |
+| catching_up_more_than_2016_blocks_after_explorers_come_back | Paused time, same rules: both explorers down for a round, then back 2085 blocks ahead: the walk finishes and the chain is followed in steps of 2016 to 2100, nobody blamed (d2097ae never got past 15) |
+| the_walk_back_is_bounded_by_what_the_rules_need | Real headers: from the last block of a period 2015 are walked (the most ever kept), from inside one back to its first, from a period's first only the 10 the median-time rule needs; regtest walks nothing |
 
-## signet_signatures.rs: signet block signatures, BIP325 (21)
-Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 330624, 331301, 331313, 331314, 331280 to 331282, and the headers 328608, 330623, 331279, 331300, 331312 and 331313), plus two altered copies of block 331314 with their proof of work ground again: one with a signature bit flipped, one with `OP_NOP` in front of its solution.
+## signet_signatures.rs: signet block signatures, BIP325 (28)
+Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 330624, 331301, 331313, 331314, 331280 to 331282, and the headers 328608, 330623, 331279, 331300, 331312 and 331313; every header 328608 to 330623, read from an explorer and checked by hash and link), plus a header ground on top of the `OP_NOP` block, and two altered copies of block 331314 with their proof of work ground again: one with a signature bit flipped, one with `OP_NOP` in front of its solution.
 
 | Test | Checks |
 |---|---|
@@ -62,15 +65,22 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | the_nop_fixture_is_the_real_block_with_one_opcode_added | The `OP_NOP` fixture differs from 331314 only by that opcode, commits to it honestly and meets the real target |
 | bootstrap_refuses_a_checkpoint_from_another_signet | Two explorers agreeing on a starting block that isn't signed for our signet: no start; with the real block it starts |
 | bootstrap_checks_the_height_proof_of_work_and_genesis | The automatic start refuses block 331314 offered at height 1 (BIP34), a signed copy missing its target, and genesis at height 1; old-block lookups refuse genesis above height 0 (all taken on 5f78d99) |
-| a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_without_blame | Real 330623 to 330624: while no two explorers give block 328608 the retarget waits, with a warning and no blame; once they agree it's checked exactly and followed (5f78d99 followed it at once) |
+| a_retarget_above_the_checkpoint_waits_for_the_periods_first_header_without_blame | Real 330623 to 330624: while the explorers can't serve the headers below the checkpoint the retarget waits, with a warning and no blame; once they do, the walk back proves them down to 328608 and the retarget is checked exactly and followed (5f78d99 followed it at once) |
 | the_first_transaction_must_be_the_only_coinbase | A regtest block whose first transaction spends an ordinary output but carries a matching witness commitment, or one with two coinbases, is refused (5f78d99 took the first) |
 | the_unsupported_solution_warning_stays_until_that_block_is_superseded | Catching up past 331313 to the `OP_NOP` 331314: the warning stays (5f78d99 cleared it), also when refused again from the cache, and goes when the real 331314 wins |
 | a_stalled_download_doesnt_hold_up_a_ready_source | Paused time: one explorer stalls on the download, the other has the block followed within the 10 s wait plus a second, one download each (5f78d99 waited on the stalled one) |
 | a_cancelled_download_leaves_no_slot_behind | Downloads given up by their callers, and a waiter giving up, leave no download slot behind (5f78d99 left two) |
 | a_new_block_is_downloaded_once_however_many_sources_offer_it | Two explorers, a slow download: the block is fetched once |
 | a_withheld_block_stops_the_run_there_without_blame | Three new headers, the third block withheld: two are followed, nobody is blamed, the tip moves once it's served |
+| one_honest_explorer_is_enough_to_prove_the_periods_first_header | Real 330623 to 330624 with a single explorer: the walk back proves 328608 and the retarget is followed (d2097ae needed two explorers to vote) |
+| an_explorer_lying_about_a_walked_header_is_caught_and_the_walk_goes_on | One explorer serves real headers from the wrong heights below the checkpoint: it's marked bad for a header that doesn't hash to what was asked, and the walk finishes from the honest one (d2097ae held the retarget) |
+| two_explorers_agreeing_on_a_wrong_period_start_change_nothing | Both explorers name 330622 (valid proof of work, same bits) as block 328608: ignored, 330624 is followed, nobody blamed (d2097ae took the vote and held the honest chain for good) |
+| a_wrong_bits_sibling_after_the_retarget_doesnt_reopen_the_hold | After the real 330624, an explorer offers a sibling one unit harder: refused as a difficulty violation, and no retarget warning comes back (d2097ae reopened it) |
+| the_unsupported_solution_warning_counts_the_whole_competing_branch | The `OP_NOP` 331314 with a block on top: after the real 331314 wins, the warning stays, since the refused branch has more work (d2097ae cleared it) |
+| many_waiting_callers_start_at_most_one_extra_download | Paused time: 20 `getblock` calls for one block from a 15 s explorer make at most 2 downloads (d2097ae made 20) |
+| one_explorer_gets_at_most_two_block_downloads_at_once | Paused time: 20 different blocks from one slow explorer: 2 downloads at a time, all 20 served (d2097ae started 20 at once) |
 
-## proofs_fees_limits.rs: proofs, fees, politeness (8)
+## proofs_fees_limits.rs: proofs, fees, politeness (9)
 | Test | Checks |
 |---|---|
 | verified_block_must_match_hash_and_merkle_root | Wrong hash, edited transaction, garbage: all refused |
@@ -81,6 +91,7 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | fee_disagreement_is_more_than_double | The 2× alarm threshold |
 | token_bucket_allows_a_burst_then_the_rate | Burst then rate; asking for more than 2/s is clamped |
 | backoff_doubles_from_five_seconds_to_a_ten_minute_cap | 5, 10, 20 … 600 s, plus jitter |
+| the_coinbase_height_matches_cores_bip34_encoding | BIP34 as Core writes `CScript() << height`: 0 as OP_0, 1 to 16 as OP_1..OP_16 (a one-byte push of them refused), 128 and 255 with a 0x00 sign byte, 32768 and 8388608, the real 331314; trailing bytes allowed, non-minimal or wrong pushes refused |
 
 ## config_rules.rs: safety rails (13)
 | Test | Checks |
@@ -209,4 +220,4 @@ Real standard-signet blocks in `tests/fixtures/` (read once from a local node: 3
 | with_the_signet_check_feature_signet_runs | With the checker built in, a signet node starts and signet's genesis passes |
 | without_the_signet_check_feature_signet_is_refused | Only in `cargo test --lib --no-default-features` (the browser build, as CI runs it): every signet block is refused, a signet node never starts and raises a critical alarm; regtest still works |
 
-**Total: 152 tests** (`cargo test --locked`), plus 1 in the browser build (`cargo test --locked --lib --no-default-features`).
+**Total: 163 tests** (`cargo test --locked`), plus 1 in the browser build (`cargo test --locked --lib --no-default-features`).

@@ -41,17 +41,11 @@ pub enum ChainError {
     },
     /// The retarget at height `at` needs the header at `height` (its
     /// period's first), which is below our checkpoint and not known yet.
-    /// Nobody is at fault; see [`HeaderChain::add_period_start`].
+    /// Nobody is at fault: the walk back from the checkpoint hasn't
+    /// reached it yet (see [`HeaderChain::walk_back_next`]).
     NeedPeriodStart {
         height: u32,
         at: u32,
-    },
-    /// The retarget's `bits` differ from what the period's first header
-    /// gives, but that header was only cross-checked between sources, not
-    /// proven to be on our chain, so we can't say who is wrong.
-    UnprovenRetarget {
-        hash: BlockHash,
-        height: u32,
     },
     TimeTooNew {
         hash: BlockHash,
@@ -73,11 +67,7 @@ impl fmt::Display for ChainError {
             ),
             ChainError::NeedPeriodStart { height, at } => write!(
                 f,
-                "the retarget at height {at} needs the header at height {height}, below our checkpoint, which we don't have yet"
-            ),
-            ChainError::UnprovenRetarget { hash, height } => write!(
-                f,
-                "header {hash} at height {height} doesn't carry the bits the period's first header gives (that header is cross-checked, not proven)"
+                "the retarget at height {at} needs the header at height {height}, below our checkpoint, and the walk back to it isn't finished"
             ),
             ChainError::TargetAboveLimit { hash } => {
                 write!(
@@ -132,10 +122,17 @@ pub struct HeaderChain {
     best: Vec<BlockHash>,
     /// The best chain before the last switch, to measure reorg depth.
     old_best: Vec<BlockHash>,
-    /// The first header of the checkpoint's retarget period when that's
-    /// below the checkpoint, by height (see [`HeaderChain::add_period_start`]).
-    period_starts: HashMap<u32, Header>,
+    /// Headers below the checkpoint, proven by hash: `walked[0]` is the
+    /// checkpoint's parent, each next one the parent of the one before
+    /// (see [`HeaderChain::walk_back_next`]). At most `base_height -
+    /// walk_stop` of them (2015 on signet), 80 bytes each.
+    walked: Vec<Header>,
+    /// The lowest height the walk back goes to.
+    walk_stop: u32,
 }
+
+/// How many headers below the checkpoint the median-time-past rule needs.
+const MTP_BELOW: u32 = 10;
 
 impl HeaderChain {
     /// Start from a trusted checkpoint header at a known height.
@@ -160,6 +157,17 @@ impl HeaderChain {
                 work: base_header.work(),
             },
         );
+        // A network that retargets needs the first header of the
+        // checkpoint's period (for the first retarget above it) and the 10
+        // before the checkpoint (for the median-time-past rule). Regtest
+        // never retargets, and needs neither walked.
+        let walk_stop = if params.no_pow_retargeting {
+            base_height
+        } else {
+            let interval = params.difficulty_adjustment_interval() as u32;
+            let period_start = base_height - base_height % interval;
+            period_start.min(base_height.saturating_sub(MTP_BELOW))
+        };
         Self {
             params,
             network,
@@ -168,7 +176,8 @@ impl HeaderChain {
             entries,
             best: vec![base_hash],
             old_best: Vec::new(),
-            period_starts: HashMap::new(),
+            walked: Vec::new(),
+            walk_stop,
         }
     }
 
@@ -223,13 +232,14 @@ impl HeaderChain {
     }
 
     /// Hash on the best chain at `height`. Height 0 always answers the
-    /// network's genesis block; other heights below the checkpoint are unknown.
+    /// network's genesis block; other heights below the checkpoint are
+    /// known only as far as the walk back has proven them.
     pub fn hash_at(&self, height: u32) -> Option<BlockHash> {
         if height == 0 {
             return Some(bitcoin::constants::genesis_block(self.network).block_hash());
         }
         if height < self.base_height {
-            return None;
+            return self.walked_hash_at(height);
         }
         self.best.get((height - self.base_height) as usize).copied()
     }
@@ -265,37 +275,75 @@ impl HeaderChain {
         times.get(times.len() / 2).copied().unwrap_or(0)
     }
 
-    /// Give the chain the first header of the checkpoint's retarget period
-    /// when that is below the checkpoint, so the next retarget can be
-    /// checked exactly (see [`ChainError::NeedPeriodStart`]). The node gets
-    /// it from two agreeing sources, so it is checked as far as it can be
-    /// here: it must be at that period's start, meet its own proof of work
-    /// within the network's limit, and carry the checkpoint's `bits` (one
-    /// period has one difficulty on a network without minimum-difficulty
-    /// blocks). It is kept for as long as the chain lives.
-    pub fn add_period_start(&mut self, height: u32, header: Header) -> Result<(), String> {
-        let interval = self.params.difficulty_adjustment_interval() as u32;
-        if self.params.no_pow_retargeting || !height.is_multiple_of(interval) {
-            return Err(format!("height {height} doesn't start a retarget period"));
+    /// The next header the walk back from the checkpoint needs, as its
+    /// height and the hash it must have, or `None` once the walk is done.
+    ///
+    /// The first retarget above a checkpoint needs its period's first
+    /// header, which can be up to 2015 blocks below the checkpoint, and the
+    /// median-time-past rule needs the 10 before the checkpoint. Nobody's
+    /// word is taken for them: each header names its parent's hash, so
+    /// starting from the checkpoint (which we trust) every header below it
+    /// is proven by hashing it. Any single source will do, and one that
+    /// serves a header with another hash is caught lying.
+    pub fn walk_back_next(&self) -> Option<(u32, BlockHash)> {
+        if self.walked.len() as u32 >= self.base_height - self.walk_stop {
+            return None;
         }
-        if height >= self.base_height || height + interval <= self.base_height {
+        let height = self.base_height - 1 - self.walked.len() as u32;
+        let child = self
+            .walked
+            .last()
+            .unwrap_or(&self.entries[&self.base_hash].header);
+        Some((height, child.prev_blockhash))
+    }
+
+    /// Whether the walk back from the checkpoint is done.
+    pub fn walk_back_done(&self) -> bool {
+        self.walk_back_next().is_none()
+    }
+
+    /// Add the header [`HeaderChain::walk_back_next`] asked for. Refused
+    /// (and nothing changes) unless it hashes to exactly that.
+    pub fn add_walked(&mut self, header: Header) -> Result<(), String> {
+        let Some((height, hash)) = self.walk_back_next() else {
+            return Err("the walk back from the checkpoint is already done".into());
+        };
+        if header.block_hash() != hash {
             return Err(format!(
-                "height {height} doesn't start our checkpoint's retarget period"
+                "the header given for height {height} doesn't hash to {hash}"
             ));
         }
-        let base_bits = self.entries[&self.base_hash].header.bits;
-        if header.bits != base_bits {
-            return Err(format!(
-                "the header at {height} has other bits than our checkpoint"
-            ));
-        }
-        let ok_pow = derive_target(header.bits, &self.params)
-            .is_some_and(|t| header.validate_pow(t).is_ok());
-        if !ok_pow {
-            return Err(format!("the header at {height} fails its proof of work"));
-        }
-        self.period_starts.insert(height, header);
+        self.walked.push(header);
         Ok(())
+    }
+
+    /// A header the walk back proved, by hash, with its height.
+    pub fn walked_header(&self, hash: &BlockHash) -> Option<(u32, Header)> {
+        let mut want = self.entries[&self.base_hash].header.prev_blockhash;
+        for (i, h) in self.walked.iter().enumerate() {
+            if want == *hash {
+                return Some((self.base_height - 1 - i as u32, *h));
+            }
+            want = h.prev_blockhash;
+        }
+        None
+    }
+
+    /// The hash of the walked header at `height`, if the walk got there.
+    pub fn walked_hash_at(&self, height: u32) -> Option<BlockHash> {
+        let i = self.base_height.checked_sub(height + 1)? as usize;
+        if i >= self.walked.len() {
+            return None;
+        }
+        Some(match i {
+            0 => self.entries[&self.base_hash].header.prev_blockhash,
+            _ => self.walked[i - 1].prev_blockhash,
+        })
+    }
+
+    /// How many headers below the checkpoint the walk has proven.
+    pub fn walked_len(&self) -> usize {
+        self.walked.len()
     }
 
     /// Check a run of headers (oldest first) whose first header's parent we
@@ -398,14 +446,29 @@ impl HeaderChain {
         Some(times[times.len() / 2])
     }
 
-    /// The parent of `e`, from the batch being checked or from what we
-    /// already know; `None` below the checkpoint.
+    /// The parent of `e`, from the batch being checked, from what we
+    /// already know, or (below the checkpoint) from the walk back; `None`
+    /// below what the walk has reached.
     fn parent_of(&self, e: &Entry, batch: &[(BlockHash, Entry)]) -> Option<Entry> {
         let parent = e.header.prev_blockhash;
-        match batch.iter().rev().find(|(h, _)| *h == parent) {
-            Some((_, p)) => Some(p.clone()),
-            None => self.entries.get(&parent).cloned(),
+        if let Some((_, p)) = batch.iter().rev().find(|(h, _)| *h == parent) {
+            return Some(p.clone());
         }
+        if let Some(p) = self.entries.get(&parent) {
+            return Some(p.clone());
+        }
+        // Below the checkpoint: the walked header one lower, if it's this
+        // parent. Its work is never used (only its time, bits and height).
+        let height = e.height.checked_sub(1)?;
+        if self.walked_hash_at(height) != Some(parent) {
+            return None;
+        }
+        let i = (self.base_height - 1 - height) as usize;
+        Some(Entry {
+            header: self.walked[i],
+            height,
+            work: Work::from_be_bytes([0; 32]),
+        })
     }
 
     /// Bitcoin Core's difficulty rule for this network (signet has no
@@ -415,8 +478,8 @@ impl HeaderChain {
     /// period's first and last headers.
     ///
     /// Just above a checkpoint the period's first header can be below it.
-    /// Then it must have been given with [`HeaderChain::add_period_start`];
-    /// until it is, the retarget header isn't accepted
+    /// Then it comes from the walk back from the checkpoint (proven by
+    /// hash); until the walk gets there, the retarget header isn't accepted
     /// ([`ChainError::NeedPeriodStart`]). A looser range (Core's
     /// `PermittedDifficultyTransition`) would let a slightly harder target
     /// through, so there is no fallback.
@@ -444,26 +507,10 @@ impl HeaderChain {
             match self.parent_of(&first, batch) {
                 Some(p) => first = p,
                 None => {
-                    let start = height - interval;
-                    let Some(anchor) = self.period_starts.get(&start) else {
-                        return Err(ChainError::NeedPeriodStart {
-                            height: start,
-                            at: height,
-                        });
-                    };
-                    let expected = next_work_required(
-                        prev.header.bits,
-                        anchor.time,
-                        prev.header.time,
-                        &self.params,
-                    );
-                    if h.bits != expected {
-                        return Err(ChainError::UnprovenRetarget {
-                            hash: h.block_hash(),
-                            height,
-                        });
-                    }
-                    return Ok(());
+                    return Err(ChainError::NeedPeriodStart {
+                        height: height - interval,
+                        at: height,
+                    });
                 }
             }
         }

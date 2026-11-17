@@ -318,15 +318,15 @@ fn an_honest_four_times_harder_retarget_survives_compact_rounding() {
     chain.connect(&[h], now).unwrap();
     assert_eq!(chain.tip_height(), 4);
 
-    // Starting from a checkpoint inside the period, with the period's
-    // first header given separately (as the node does): the same header is
+    // Starting from a checkpoint inside the period, with the headers below
+    // it walked back by hash (as the node does): the same header is
     // accepted, one unit harder is not.
     let mut chain = HeaderChain::with_params(p, 3, last);
-    chain.add_period_start(0, base).unwrap();
+    walk(&mut chain, &[hs[1], hs[0], base]);
     let too_hard = mine_bits(&last, last.time + 1, 0x2005_3f3a);
     assert!(matches!(
         chain.check(&[too_hard], now).unwrap_err(),
-        ChainError::UnprovenRetarget { height: 4, .. }
+        ChainError::BadDifficulty { height: 4, .. }
     ));
     chain.connect(&[h], now).unwrap();
     assert_eq!(chain.tip_height(), 4);
@@ -392,20 +392,29 @@ fn a_retarget_just_above_a_checkpoint_needs_the_periods_first_header() {
         ChainError::NeedPeriodStart { height: 0, at: 4 }
     );
 
-    // A wrong first header is refused: not at a period start, not in the
-    // checkpoint's period, or with other bits.
-    assert!(chain.add_period_start(1, hs[0]).is_err());
-    let mut other_bits = base;
+    // The walk back takes only the header with the hash it asked for: not
+    // one from another height, nor the right one with other bits.
+    assert_eq!(chain.walk_back_next(), Some((2, hs[1].block_hash())));
+    assert!(chain.add_walked(hs[0]).is_err());
+    let mut other_bits = hs[1];
     other_bits.bits = CompactTarget::from_consensus(REGTEST_BITS);
-    assert!(chain.add_period_start(0, other_bits).is_err());
-    let mut far = HeaderChain::with_params(short_signet_params(), 7, last);
-    assert!(far.add_period_start(0, base).is_err());
+    assert!(chain.add_walked(other_bits).is_err());
+    assert_eq!(chain.walked_len(), 0);
+    // Part of the way is not enough.
+    walk(&mut chain, &[hs[1], hs[0]]);
+    assert_eq!(
+        chain.check(&[exact], now).unwrap_err(),
+        ChainError::NeedPeriodStart { height: 0, at: 4 }
+    );
 
-    // With the real first header the retarget is exact.
-    chain.add_period_start(0, base).unwrap();
+    // With the walk at the first header the retarget is exact, and a
+    // wrong one is provably wrong.
+    walk(&mut chain, &[base]);
+    assert!(chain.walk_back_done());
+    assert!(chain.add_walked(base).is_err());
     assert!(matches!(
         chain.check(&[harder], now).unwrap_err(),
-        ChainError::UnprovenRetarget { height: 4, .. }
+        ChainError::BadDifficulty { height: 4, .. }
     ));
     chain.connect(&[exact], now).unwrap();
     assert_eq!(chain.tip_height(), 4);
@@ -487,7 +496,25 @@ fn the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period() {
             at: 330_624
         }
     );
-    chain.add_period_start(328_608, h608).unwrap();
+    // Walk back from the checkpoint through the real headers, 330622 down
+    // to 328608: each proven by its hash, and no more than that kept.
+    let period: Vec<bitcoin::block::Header> =
+        include_bytes!("fixtures/signet-328608-to-330623-headers.bin")
+            .chunks(80)
+            .map(|c| bitcoin::consensus::encode::deserialize(c).unwrap())
+            .collect();
+    assert_eq!(period[0], h608);
+    assert_eq!(period[2015], h623);
+    let below: Vec<_> = period[..2015].iter().rev().copied().collect();
+    walk(&mut chain, &below);
+    assert!(chain.walk_back_done());
+    assert_eq!(chain.walked_len(), 2015);
+    assert_eq!(chain.hash_at(328_608), Some(h608.block_hash()));
+    assert_eq!(
+        chain.walked_header(&h608.block_hash()),
+        Some((328_608, h608))
+    );
+    assert_eq!(chain.hash_at(328_607), None);
     // One unit harder: Core's permitted range allows it (5f78d99 did), the
     // exact rule doesn't. The bits are checked before the proof of work,
     // so an unmined header shows which rule refuses it.
@@ -495,7 +522,7 @@ fn the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period() {
     harder.bits = CompactTarget::from_consensus(0x1d14_fced);
     assert!(matches!(
         chain.check(&[harder], now).unwrap_err(),
-        ChainError::UnprovenRetarget {
+        ChainError::BadDifficulty {
             height: 330_624,
             ..
         }
@@ -508,4 +535,168 @@ fn the_real_retarget_at_330624_is_exact_from_a_checkpoint_inside_its_period() {
     ));
     chain.connect(&[h624], now).unwrap();
     assert_eq!(chain.tip_hash(), h624.block_hash());
+}
+
+// ---------- third review (2026-11-17): walking back from the checkpoint ----------
+
+/// Regtest's rules, but retargeting every 16 blocks, so a node test can
+/// reach a retarget on blocks it mines itself.
+fn retargeting_regtest() -> bitcoin::params::Params {
+    let mut p = bitcoin::params::Params::new(Network::Regtest);
+    p.no_pow_retargeting = false;
+    p.pow_target_timespan = 16 * 600;
+    p
+}
+
+/// A regtest chain of `n` blocks 800 s apart: slower than the target, so
+/// every retarget stays at regtest's limit and the bits never change.
+fn slow_chain(n: u32) -> Vec<bitcoin::Block> {
+    let mut blocks = vec![genesis()];
+    for h in 1..=n {
+        let prev = blocks.last().unwrap().header;
+        let mut b = mine(&prev, h, vec![], 1, REGTEST_BITS);
+        b.header.time = prev.time + 800;
+        b.header.nonce = 0;
+        while b.header.validate_pow(b.header.target()).is_err() {
+            b.header.nonce += 1;
+        }
+        blocks.push(b);
+    }
+    blocks
+}
+
+/// A fake explorer showing `blocks`, serving every header by hash quickly.
+fn indexed_source(name: &str, blocks: &[bitcoin::Block]) -> std::sync::Arc<FakeSource> {
+    let s = FakeSource::honest(name, blocks);
+    s.with(|st| {
+        st.extra_headers = blocks.iter().map(|b| (b.block_hash(), b.header)).collect();
+    });
+    s
+}
+
+fn retargeting_node(
+    sources: &[std::sync::Arc<FakeSource>],
+    blocks: &[bitcoin::Block],
+    checkpoint: u32,
+) -> trust_issues::node::Node {
+    use std::sync::Arc;
+    let dyns: Vec<Arc<dyn trust_issues::source::Source>> = sources
+        .iter()
+        .map(|s| s.clone() as Arc<dyn trust_issues::source::Source>)
+        .collect();
+    let clock = Arc::new(trust_issues::node::ManualClock::new(now_after(blocks)));
+    trust_issues::node::Node::new(
+        settings(Some((checkpoint, blocks[checkpoint as usize].block_hash()))),
+        dyns,
+        clock,
+    )
+    .with_chain_params(retargeting_regtest())
+}
+
+#[tokio::test]
+async fn a_checkpoint_just_below_the_first_retarget_needs_no_vote_on_genesis() {
+    let blocks = slow_chain(20);
+    let up = indexed_source("up", &blocks);
+    let down = indexed_source("down", &blocks);
+    down.with(|st| st.fail = Some(trust_issues::source::SourceError::Transport("down".into())));
+    // The checkpoint is the last block of the first period, so the
+    // retarget at 16 needs the period's first block: genesis, which we
+    // know ourselves. d2097ae asked two explorers to vote on it, and one
+    // was down: the chain stopped at 15.
+    let node = retargeting_node(&[up, down], &blocks, 15);
+    node.start().await.expect("start");
+    for _ in 0..3 {
+        node.tick().await;
+    }
+    assert_eq!(
+        node.with_chain(|c| c.tip_height()),
+        20,
+        "{:?}",
+        node.alarms()
+    );
+    assert!(!node.alarms().contains_key("retarget-held"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn catching_up_more_than_2016_blocks_after_explorers_come_back() {
+    let blocks = slow_chain(2100);
+    let a = indexed_source("a", &blocks);
+    let b = indexed_source("b", &blocks);
+    let node = retargeting_node(&[a.clone(), b.clone()], &blocks, 15);
+    node.start().await.expect("start");
+    // Both explorers go down: nothing can be walked or followed.
+    let down = trust_issues::source::SourceError::Transport("down".into());
+    for s in [&a, &b] {
+        s.with(|st| st.fail = Some(down.clone()));
+    }
+    node.tick().await;
+    assert_eq!(node.with_chain(|c| c.tip_height()), 15);
+    // They come back 2085 blocks ahead of us: more than one walk from
+    // their tip (2016 headers) can cover. d2097ae gave up there for good.
+    for s in [&a, &b] {
+        s.with(|st| st.fail = None);
+    }
+    // (Past the backoff their failures earned.)
+    tokio::time::advance(trust_issues::limits::BACKOFF_CAP * 2).await;
+    for _ in 0..5 {
+        node.tick().await;
+    }
+    assert_eq!(
+        node.with_chain(|c| c.tip_height()),
+        2100,
+        "{:?}",
+        node.alarms()
+    );
+    assert!(!node.alarms().keys().any(|k| k.starts_with("source-bad:")));
+    assert!(!node.alarms().contains_key("retarget-held"));
+}
+
+/// Give the chain these headers below its checkpoint, newest first, as the
+/// node's walk back does.
+fn walk(chain: &mut HeaderChain, newest_first: &[bitcoin::block::Header]) {
+    for h in newest_first {
+        chain.add_walked(*h).unwrap();
+    }
+}
+
+#[test]
+fn the_walk_back_is_bounded_by_what_the_rules_need() {
+    let period: Vec<bitcoin::block::Header> =
+        include_bytes!("fixtures/signet-328608-to-330623-headers.bin")
+            .chunks(80)
+            .map(|c| bitcoin::consensus::encode::deserialize(c).unwrap())
+            .collect();
+    let newest_first = |n: usize| period[..n].iter().rev().copied().collect::<Vec<_>>();
+    // The last block of a period: 2015 headers back to its first, the
+    // most the walk ever keeps (80 bytes each).
+    let mut last = HeaderChain::new(Network::Signet, 330_623, period[2015]);
+    walk(&mut last, &newest_first(2015));
+    assert!(last.walk_back_done());
+    assert_eq!(last.walked_len(), 2015);
+    // Inside a period: back to its first (330613 is 2005 in).
+    let mut inside = HeaderChain::new(Network::Signet, 330_613, period[2005]);
+    assert_eq!(inside.walk_back_next().map(|(h, _)| h), Some(330_612));
+    walk(&mut inside, &newest_first(2005));
+    assert!(inside.walk_back_done());
+    assert_eq!(inside.walked_len(), 2005);
+    // A period's first block needs only the 10 before it, for the
+    // median-time-past rule: 330614..330623.
+    let b624: bitcoin::Block = bitcoin::consensus::encode::deserialize(
+        &<Vec<u8> as bitcoin::hex::FromHex>::from_hex(
+            include_str!("fixtures/signet-330624-block.hex").trim(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut first = HeaderChain::new(Network::Signet, 330_624, b624.header);
+    walk(
+        &mut first,
+        &period[2006..].iter().rev().copied().collect::<Vec<_>>(),
+    );
+    assert!(first.walk_back_done());
+    assert_eq!(first.walked_len(), 10);
+    // Regtest never retargets: nothing to walk.
+    let blocks = build_chain(20, 1);
+    let regtest = HeaderChain::new(Network::Regtest, 20, blocks[20].header);
+    assert!(regtest.walk_back_done());
 }

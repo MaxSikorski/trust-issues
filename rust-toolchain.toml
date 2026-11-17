@@ -1,0 +1,5 @@
+# Pinned compiler (1.99.1, released 2026-10-15). Builds use --locked.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

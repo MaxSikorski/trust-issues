@@ -1,0 +1,28 @@
+[package]
+name = "trust-issues"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MaxSikorski/trust-issues"
+description = "A stand-in bitcoind for Lightning nodes that reads the chain from several block explorers over Tor (signet-only milestone)"
+publish = false
+
+[dependencies]
+bitcoin = { version = "0.32", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls-native-roots"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+getrandom = "0.3"
+async-trait = "0.1"
+anyhow = "1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

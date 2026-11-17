@@ -1,0 +1,13 @@
+Trust Issues (trust-issues)
+Copyright 2026 Max Sikorski
+
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or
+the MIT license (LICENSE-MIT), at your option.
+
+This product depends on third-party crates, each under its own permissive
+licence (checked with `cargo deny`; see deny.toml), including rust-bitcoin
+(CC0-1.0), tokio, reqwest, axum and serde (MIT or Apache-2.0).
+
+Ideas, not code, were taken from Core Lightning's trustedcoin and sauron
+plugins, spruned, Start9's btc-rpc-proxy, Blockstream's Esplora API and
+mempool.space's API.

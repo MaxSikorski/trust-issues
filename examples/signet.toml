@@ -1,0 +1,32 @@
+# trust-issues on signet. Copy and edit; see README.md.
+network = "signet"
+
+# Your local Tor's SOCKS port (Tor Browser uses 9150, the tor service 9050).
+tor_socks = "127.0.0.1:9050"
+
+# bitcoind's usual signet RPC port. Keep it on this machine.
+rpc_bind = "127.0.0.1:38332"
+data_dir = ".data/signet"
+
+# Optional: also accept a fixed user/password besides the cookie file.
+# rpc_user = "lnd"
+# rpc_password = "change-me"
+
+# How often to poll each source's tip (seconds, at least 10).
+poll_interval_secs = 60
+
+# Pin a starting block you trust ("height:hash"). Without it, the node starts
+# six blocks below the tip that two sources agree on.
+# checkpoint = "331223:000000083a22d511e2687f326ca3209d9955ea04bf9338d8727a1f4f937854e2"
+
+# Leave `sources` out to use mempool.space and blockstream.info over their
+# onions. Or list your own; you need at least two. A self-hosted Esplora on
+# your own network is reached directly (no Tor needed, it never leaves home).
+#
+# [[sources]]
+# name = "mempool.space"
+# url = "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
+#
+# [[sources]]
+# name = "my-esplora"
+# url = "http://192.168.1.20:3002/api"

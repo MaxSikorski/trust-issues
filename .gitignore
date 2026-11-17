@@ -1,0 +1,22 @@
+# Rust
+target/
+
+# Local runtime state (cookie, data dirs)
+.data/
+*.cookie
+
+# Secrets and local config (never commit)
+.env
+.env.*
+*.macaroon
+
+# Python (always through uv)
+.venv/
+__pycache__/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+

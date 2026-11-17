@@ -2,7 +2,7 @@
 //! withhold, rate-limit or drop broadcasts. Used by the demo and the tests.
 //! No network, no keys, no real coins.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::node::{ManualClock, Node, Settings};
@@ -150,6 +150,9 @@ pub struct FakeState {
     pub genesis_override: Option<BlockHash>,
     /// Every call fails with this.
     pub fail: Option<SourceError>,
+    /// The next calls fail with these, one each, front first; then the
+    /// source answers normally again (a flaky explorer or Tor circuit).
+    pub fail_next: VecDeque<SourceError>,
     pub tamper_blocks: bool,
     /// header(hash) answers this instead of the truth.
     pub header_lie: Option<Header>,
@@ -210,6 +213,9 @@ impl FakeSource {
         s.calls += 1;
         if let Some(e) = &s.fail {
             return Err(e.clone());
+        }
+        if let Some(e) = s.fail_next.pop_front() {
+            return Err(e);
         }
         Ok(s)
     }

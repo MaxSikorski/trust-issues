@@ -15,6 +15,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -47,6 +48,10 @@ pub const BROADCAST_GIVE_UP_SECS: u64 = 14 * 24 * 60 * 60;
 pub const BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
 /// Sources needed for "synced", for "unspent", and to count a broadcast as seen.
 pub const MIN_AGREEING: usize = 2;
+/// The longest an old-block lookup waits for a missed source's backoff
+/// before asking it once more. Longer than that (a long `Retry-After`), we
+/// fail closed instead of holding the wallet's RPC call open.
+pub const OLD_BLOCK_RETRY_MAX_WAIT: Duration = Duration::from_secs(15);
 
 /// Unix seconds. Injected so tests can move time deterministically.
 pub trait Clock: Send + Sync {
@@ -338,30 +343,105 @@ impl Node {
                 "fewer than two sources are usable for old blocks right now",
             ));
         }
+        let mut answers: Vec<(usize, BlockHash)> = Vec::new();
+        // Sources that missed for a reason that may pass (Tor, 5xx, 429,
+        // backoff). "Not found" and malformed answers are answers.
+        let mut missed: Vec<usize> = Vec::new();
         let ask = |ids: Vec<usize>| {
             join_all(ids.into_iter().map(|i| async move {
-                self.call(i, move |s| async move { s.block_hash_at(height).await })
-                    .await
-                    .ok()
-                    .map(|h| (i, h))
+                let r = self
+                    .call(i, move |s| async move { s.block_hash_at(height).await })
+                    .await;
+                (i, r)
             }))
         };
+        let sort = |results: Vec<(usize, Result<BlockHash, SourceError>)>,
+                    answers: &mut Vec<(usize, BlockHash)>,
+                    missed: &mut Vec<usize>| {
+            for (i, r) in results {
+                match r {
+                    Ok(h) => answers.push((i, h)),
+                    Err(
+                        SourceError::Transport(_)
+                        | SourceError::RateLimited { .. }
+                        | SourceError::Cooling
+                        | SourceError::Http { status: 500.., .. },
+                    ) => missed.push(i),
+                    Err(_) => {}
+                }
+            }
+        };
         let (first, rest) = order.split_at(MIN_AGREEING);
-        let mut answers: Vec<(usize, BlockHash)> =
-            ask(first.to_vec()).await.into_iter().flatten().collect();
+        sort(ask(first.to_vec()).await, &mut answers, &mut missed);
+        // A source caught lying (here or by the poller) doesn't vote, and its
+        // answer never decides who else is asked.
+        answers.retain(|&(i, _)| self.usable(i, self.clock.now()));
         let agreed =
             answers.len() == MIN_AGREEING && answers.iter().all(|(_, h)| *h == answers[0].1);
         if !agreed && !rest.is_empty() {
-            answers.extend(ask(rest.to_vec()).await.into_iter().flatten());
+            sort(ask(rest.to_vec()).await, &mut answers, &mut missed);
         }
-        let mut votes: Vec<(BlockHash, usize)> = Vec::new();
-        for (_, h) in &answers {
-            match votes.iter_mut().find(|(v, _)| v == h) {
-                Some((_, n)) => *n += 1,
-                None => votes.push((*h, 1)),
+        // One missed lookup used to fail the whole call, and LND's rescan
+        // doesn't ask again (2026-11-17). So when there's no winner yet, ask
+        // each missed source once more, after its own backoff has run out,
+        // never sooner. Still two agreeing answers or nothing.
+        answers.retain(|&(i, _)| self.usable(i, self.clock.now()));
+        if Self::old_block_winner(&answers).is_none() && !missed.is_empty() {
+            let now = Instant::now();
+            let waits: Vec<(usize, Duration)> = missed
+                .iter()
+                .map(|&i| {
+                    let until = lock(&self.sources[i].state).cooling_until;
+                    (
+                        i,
+                        until.map_or(Duration::ZERO, |u| u.saturating_duration_since(now)),
+                    )
+                })
+                .filter(|(_, d)| *d <= OLD_BLOCK_RETRY_MAX_WAIT)
+                .collect();
+            if let Some(wait) = waits.iter().map(|(_, d)| *d).max() {
+                crate::time::sleep(wait).await;
+                // Caught lying while we waited: not asked.
+                let now = self.clock.now();
+                let mut out: Vec<usize> = waits
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .filter(|&i| self.usable(i, now))
+                    .collect();
+                let mut pending: FuturesUnordered<_> = out
+                    .clone()
+                    .into_iter()
+                    .map(|i| async move {
+                        let r = self
+                            .call(i, move |s| async move { s.block_hash_at(height).await })
+                            .await;
+                        (i, r)
+                    })
+                    .collect();
+                // Stop as soon as the answers still out can't change the
+                // outcome, so one hung source can't hold the wallet's call
+                // past its timeout (LND's and CLN's are 60 s).
+                while let Some((i, r)) = pending.next().await {
+                    if let Ok(h) = r {
+                        answers.push((i, h));
+                    }
+                    out.retain(|&j| j != i);
+                    let now = self.clock.now();
+                    answers.retain(|&(j, _)| self.usable(j, now));
+                    // Votes still out from sources since caught lying would
+                    // be dropped anyway, so they don't hold us up.
+                    let still_out = out.iter().filter(|&&j| self.usable(j, now)).count();
+                    let lead = Self::old_block_votes(&answers).first().map_or(0, |v| v.1);
+                    if Self::old_block_winner(&answers).is_some()
+                        && 2 * lead > answers.len() + still_out
+                    {
+                        break;
+                    }
+                }
             }
         }
-        votes.sort_by_key(|v| std::cmp::Reverse(v.1));
+        answers.retain(|&(i, _)| self.usable(i, self.clock.now()));
+        let votes = Self::old_block_votes(&answers);
         if votes.len() > 1 {
             let names: Vec<String> = answers.iter().map(|(i, _)| self.name(*i)).collect();
             warn!(height, sources = ?names, "sources disagree about an old block");
@@ -373,23 +453,17 @@ impl Node {
                     names.join(", ")
                 ),
             );
-        } else {
+        } else if Self::old_block_winner(&answers).is_some() {
+            // Cleared by agreement, never by sources that didn't answer.
             self.clear_alarm("old-block-disagreement");
         }
-        let winner = match votes.as_slice() {
-            [(h, n), rest @ ..] if *n >= MIN_AGREEING && rest.iter().all(|(_, m)| m < n) => *h,
-            [] | [(_, 1)] => {
-                return Err(RpcError::new(
-                    RPC_MISC_ERROR,
-                    "fewer than two sources answered for this height",
-                ));
-            }
-            _ => {
-                return Err(RpcError::new(
-                    RPC_MISC_ERROR,
-                    "sources disagree about the block at this height",
-                ));
-            }
+        let Some(winner) = Self::old_block_winner(&answers) else {
+            let why = if matches!(votes.as_slice(), [] | [(_, 1)]) {
+                "fewer than two sources answered for this height"
+            } else {
+                "sources disagree about the block at this height"
+            };
+            return Err(RpcError::new(RPC_MISC_ERROR, why));
         };
         // The block just below the checkpoint is provable: the checkpoint
         // header names its parent.
@@ -445,6 +519,28 @@ impl Node {
             RPC_MISC_ERROR,
             "no source served a valid header for this height",
         ))
+    }
+
+    /// Distinct hashes among old-block answers, most votes first.
+    fn old_block_votes(answers: &[(usize, BlockHash)]) -> Vec<(BlockHash, usize)> {
+        let mut votes: Vec<(BlockHash, usize)> = Vec::new();
+        for (_, h) in answers {
+            match votes.iter_mut().find(|(v, _)| v == h) {
+                Some((_, n)) => *n += 1,
+                None => votes.push((*h, 1)),
+            }
+        }
+        votes.sort_by_key(|v| std::cmp::Reverse(v.1));
+        votes
+    }
+
+    /// The old-block hash with at least two votes and a strict majority of
+    /// all answers (2–1–1 is not a majority).
+    fn old_block_winner(answers: &[(usize, BlockHash)]) -> Option<BlockHash> {
+        match Self::old_block_votes(answers).as_slice() {
+            [(h, n), ..] if *n >= MIN_AGREEING && 2 * *n > answers.len() => Some(*h),
+            _ => None,
+        }
     }
 
     /// A below-checkpoint header found by [`Node::deep_hash_at`], with its height.
@@ -506,6 +602,13 @@ impl Node {
         };
         if !wait.is_zero() {
             crate::time::sleep(wait).await;
+            // Another request may have been told to back off meanwhile.
+            if lock(&h.state)
+                .cooling_until
+                .is_some_and(|u| Instant::now() < u)
+            {
+                return Err(SourceError::Cooling);
+            }
         }
         let res = f(h.source.clone()).await;
         self.mark_progress();
@@ -522,14 +625,15 @@ impl Node {
                     .map(Duration::from_secs)
                     .unwrap_or_else(|| backoff(st.failures, (self.settings.jitter)()))
                     .min(BACKOFF_CAP);
-                st.cooling_until = Some(Instant::now() + d);
+                st.cooling_until = st.cooling_until.max(Some(Instant::now() + d));
                 st.last_error = Some(e.to_string());
                 warn!(source = %h.source.name(), wait_secs = d.as_secs(), "rate limited; backing off");
             }
             Err(e @ (SourceError::Transport(_) | SourceError::Http { status: 500.., .. })) => {
                 st.failures += 1;
                 let d = backoff(st.failures, (self.settings.jitter)());
-                st.cooling_until = Some(Instant::now() + d);
+                // Never shorten a longer wait another answer asked for.
+                st.cooling_until = st.cooling_until.max(Some(Instant::now() + d));
                 st.last_error = Some(e.to_string());
             }
             Err(e @ SourceError::Http { .. }) => {

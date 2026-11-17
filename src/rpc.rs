@@ -17,6 +17,7 @@ use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid};
 use serde_json::{Value, json};
+use tracing::{debug, warn};
 
 use crate::fees;
 use crate::node::{
@@ -233,7 +234,17 @@ async fn process_one(node: &Node, req: Value) -> (StatusCode, Value) {
         );
     };
     let params = req.get("params").cloned().unwrap_or(Value::Array(vec![]));
+    let clean_method = crate::source::clean_text(method);
+    debug!(method = %clean_method, "rpc call");
     let result = dispatch(node, method, &params).await;
+    if matches!(&result, Err(e) if e.code == RPC_METHOD_NOT_FOUND)
+        && node.note_unsupported_rpc(&clean_method)
+    {
+        warn!(
+            method = %clean_method,
+            "a client asked for an RPC method Trust Issues doesn't support yet"
+        );
+    }
     let status = match &result {
         Ok(_) => StatusCode::OK,
         Err(e) if e.code == RPC_METHOD_NOT_FOUND => StatusCode::NOT_FOUND,

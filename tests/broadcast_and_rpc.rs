@@ -767,3 +767,77 @@ fn amounts_are_written_with_eight_decimals_like_bitcoin_core() {
     let back: Value = serde_json::from_str(&to_core_json(&v)).unwrap();
     assert_eq!(back["mempoolminfee"], 0.00001);
 }
+
+fn unsupported_list(node: &Node) -> Vec<String> {
+    node.status()["unsupported_rpc_methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_unknown_method_is_listed_once_on_status_and_still_answers_not_found() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    for _ in 0..3 {
+        let (status, v) = rpc(&node, "getmempoolinfo_nope", json!([])).await;
+        assert_eq!(status, 404);
+        assert_eq!(v["error"]["code"], -32601);
+    }
+    let batch = json!([{"id": 1, "method": "zzz"}, {"id": 2, "method": "aaa"}]);
+    process_body(&node, batch.to_string().as_bytes()).await;
+    assert_eq!(
+        unsupported_list(&node),
+        vec!["aaa", "getmempoolinfo_nope", "zzz"],
+        "once each, sorted, batches counted per call"
+    );
+}
+
+#[tokio::test]
+async fn known_methods_never_appear_in_the_unsupported_list() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let (status, _) = rpc(&node, "getblockcount", json!([])).await;
+    assert_eq!(status, 200);
+    assert!(unsupported_list(&node).is_empty());
+}
+
+#[tokio::test]
+async fn a_dirty_long_method_name_is_cleaned_and_truncated_in_the_list() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    let dirty = format!("  evil\n\u{1b}[31m{}  ", "x".repeat(500));
+    rpc(&node, &dirty, json!([])).await;
+    let list = unsupported_list(&node);
+    assert_eq!(list.len(), 1);
+    assert!(list[0].starts_with("evil[31mxxx"));
+    assert!(list[0].chars().count() <= 200);
+    assert!(!list[0].chars().any(|c| c.is_control()));
+}
+
+#[tokio::test]
+async fn the_unsupported_list_is_capped() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    for i in 0..200 {
+        rpc(&node, &format!("nope{i}"), json!([])).await;
+    }
+    assert_eq!(unsupported_list(&node).len(), 64);
+}
+
+#[tokio::test]
+async fn params_never_appear_on_status() {
+    let blocks = build_chain(2, 1);
+    let (node, _) = started_node(&[FakeSource::honest("a", &blocks)], &blocks).await;
+    rpc(
+        &node,
+        "importprivkey",
+        json!(["SECRETPARAM123", {"k": "SECRETPARAM456"}]),
+    )
+    .await;
+    let text = node.status().to_string();
+    assert!(text.contains("importprivkey"));
+    assert!(!text.contains("SECRETPARAM"));
+}

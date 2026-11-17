@@ -222,7 +222,13 @@ pub struct Node {
     deep: Mutex<DeepHeaders>,
     /// One old-block lookup at a time (see [`Node::deep_hash_at`]).
     deep_lookup: futures::lock::Mutex<()>,
+    /// Cleaned names of RPC methods clients asked for that we don't support
+    /// (at most [`UNSUPPORTED_RPC_MAX`]); shown on `/status`.
+    unsupported_rpc: Mutex<BTreeSet<String>>,
 }
+
+/// How many distinct unsupported RPC method names to remember.
+pub const UNSUPPORTED_RPC_MAX: usize = 64;
 
 /// How many below-checkpoint headers to remember.
 const DEEP_CACHE_MAX: usize = 4096;
@@ -301,6 +307,7 @@ impl Node {
             last_progress: AtomicU64::new(started_at),
             deep: Mutex::new(DeepHeaders::default()),
             deep_lookup: futures::lock::Mutex::new(()),
+            unsupported_rpc: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -1529,6 +1536,14 @@ impl Node {
 
     // ---------- status ----------
 
+    /// Remember that a client asked for an RPC method we don't support.
+    /// Returns true the first time a (cleaned) name is seen and there is
+    /// room for it; the set can't grow past [`UNSUPPORTED_RPC_MAX`].
+    pub fn note_unsupported_rpc(&self, cleaned: &str) -> bool {
+        let mut set = lock(&self.unsupported_rpc);
+        set.len() < UNSUPPORTED_RPC_MAX && set.insert(cleaned.to_string())
+    }
+
     pub fn status(&self) -> Value {
         let now = self.clock.now();
         let (tip_height, tip_hash, base) = {
@@ -1567,6 +1582,7 @@ impl Node {
             "healthy_sources": self.healthy_count(),
             "sources": sources,
             "alarms": alarms,
+            "unsupported_rpc_methods": lock(&self.unsupported_rpc).iter().cloned().collect::<Vec<_>>(),
             "pending_broadcasts": lock(&self.pending).keys().map(|t| t.to_string()).collect::<Vec<_>>(),
             "fee_estimates_sat_vb": {
                 "2": self.estimate_fee(2),

@@ -108,7 +108,7 @@ Two examples are not tests:
 | fees_combine_across_sources_and_disagreement_raises_an_alarm | Median, max when urgent, alarm above 2× |
 | a_rate_limited_source_cools_off_while_the_others_carry_on | 429 + Retry-After: no requests while cooling, back afterwards |
 
-## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (29)
+## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (34)
 | Test | Checks |
 |---|---|
 | broadcast_goes_to_every_source_and_succeeds_if_any_accepts | Every source is sent it; one acceptance is success |
@@ -140,6 +140,11 @@ Two examples are not tests:
 | a_chain_block_offered_as_an_old_one_is_refused | A block on our proven chain can't be served as an older height |
 | an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
 | amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
+| an_unknown_method_is_listed_once_on_status_and_still_answers_not_found | An unsupported method still gets -32601; `/status` lists each name once, sorted, batches included |
+| known_methods_never_appear_in_the_unsupported_list | Supported methods are never listed as unsupported |
+| a_dirty_long_method_name_is_cleaned_and_truncated_in_the_list | Control characters are stripped and names cut to 200 characters |
+| the_unsupported_list_is_capped | At most 64 distinct names are kept |
+| params_never_appear_on_status | Request params never reach `/status` |
 
 ## src/main.rs: the program itself (2)
 | Test | Checks |
@@ -152,4 +157,4 @@ Two examples are not tests:
 |---|---|
 | retry_after_on_a_503_is_a_rate_limit | A 503 with `Retry-After` is a slow-down like a 429; a bare 503 stays a server error |
 
-**Total: 106 tests.**
+**Total: 111 tests.**

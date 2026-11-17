@@ -211,6 +211,45 @@ pub struct Node {
     /// successful or not. The systemd watchdog pings only while this is
     /// recent, so a hung node gets restarted instead of serving a stale tip.
     last_progress: AtomicU64,
+    /// Headers below the checkpoint that two sources agreed on (see
+    /// [`Node::deep_hash_at`]). Cross-checked, not proven to link to our
+    /// chain, so they're kept apart from it.
+    deep: Mutex<DeepHeaders>,
+    /// One old-block lookup at a time (see [`Node::deep_hash_at`]).
+    deep_lookup: futures::lock::Mutex<()>,
+}
+
+/// How many below-checkpoint headers to remember.
+const DEEP_CACHE_MAX: usize = 4096;
+
+#[derive(Default)]
+struct DeepHeaders {
+    by_height: HashMap<u32, BlockHash>,
+    by_hash: HashMap<BlockHash, (u32, Header)>,
+    /// Oldest first, for eviction.
+    order: VecDeque<BlockHash>,
+}
+
+impl DeepHeaders {
+    fn hash_at(&self, height: u32) -> Option<BlockHash> {
+        self.by_height.get(&height).copied()
+    }
+
+    fn insert(&mut self, height: u32, hash: BlockHash, header: Header) {
+        if self.by_hash.contains_key(&hash) {
+            return;
+        }
+        while self.order.len() >= DEEP_CACHE_MAX {
+            if let Some(old) = self.order.pop_front()
+                && let Some((h, _)) = self.by_hash.remove(&old)
+            {
+                self.by_height.remove(&h);
+            }
+        }
+        self.by_height.insert(height, hash);
+        self.by_hash.insert(hash, (height, header));
+        self.order.push_back(hash);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -255,7 +294,162 @@ impl Node {
             rotation: AtomicUsize::new(0),
             started_at,
             last_progress: AtomicU64::new(started_at),
+            deep: Mutex::new(DeepHeaders::default()),
+            deep_lookup: futures::lock::Mutex::new(()),
         }
+    }
+
+    /// The block hash at a height below our checkpoint, for wallets that
+    /// look up old blocks (LND's wallet searches from block 0 for its
+    /// "birthday", then rescans from there). We can't prove these link to
+    /// our chain, so we cross-check and fail closed:
+    /// - two usable sources are asked (rotating). If they agree, that's the
+    ///   answer. If not, the rest are asked too, and a hash wins only with
+    ///   at least two votes and a strict majority; otherwise we refuse.
+    ///   Either way a disagreement raises an alarm (we can't prove who's
+    ///   wrong, so nobody is marked bad for it);
+    /// - the header must hash to that block and meet its own proof-of-work
+    ///   target within the network's limit. A source serving a header that
+    ///   doesn't is marked bad. (On signet that target is very easy, so the
+    ///   real protection here is the two-source agreement.)
+    ///
+    /// Lookups run one at a time, so a wallet rescan can't book the sources'
+    /// request budget far ahead of tip polling. The tip, which Lightning's
+    /// safety depends on, never comes from here.
+    pub async fn deep_hash_at(&self, height: u32) -> Result<BlockHash, RpcError> {
+        if height >= self.read_chain().base_height() {
+            return Err(RpcError::new(
+                RPC_INVALID_PARAMETER,
+                "Block height out of range",
+            ));
+        }
+        if let Some(h) = lock(&self.deep).hash_at(height) {
+            return Ok(h);
+        }
+        let _one_at_a_time = self.deep_lookup.lock().await;
+        // Someone may have looked it up while we waited.
+        if let Some(h) = lock(&self.deep).hash_at(height) {
+            return Ok(h);
+        }
+        let order = self.rotated();
+        if order.len() < MIN_AGREEING {
+            return Err(RpcError::new(
+                RPC_MISC_ERROR,
+                "fewer than two sources are usable for old blocks right now",
+            ));
+        }
+        let ask = |ids: Vec<usize>| {
+            join_all(ids.into_iter().map(|i| async move {
+                self.call(i, move |s| async move { s.block_hash_at(height).await })
+                    .await
+                    .ok()
+                    .map(|h| (i, h))
+            }))
+        };
+        let (first, rest) = order.split_at(MIN_AGREEING);
+        let mut answers: Vec<(usize, BlockHash)> =
+            ask(first.to_vec()).await.into_iter().flatten().collect();
+        let agreed =
+            answers.len() == MIN_AGREEING && answers.iter().all(|(_, h)| *h == answers[0].1);
+        if !agreed && !rest.is_empty() {
+            answers.extend(ask(rest.to_vec()).await.into_iter().flatten());
+        }
+        let mut votes: Vec<(BlockHash, usize)> = Vec::new();
+        for (_, h) in &answers {
+            match votes.iter_mut().find(|(v, _)| v == h) {
+                Some((_, n)) => *n += 1,
+                None => votes.push((*h, 1)),
+            }
+        }
+        votes.sort_by_key(|v| std::cmp::Reverse(v.1));
+        if votes.len() > 1 {
+            let names: Vec<String> = answers.iter().map(|(i, _)| self.name(*i)).collect();
+            warn!(height, sources = ?names, "sources disagree about an old block");
+            self.set_alarm(
+                "old-block-disagreement",
+                AlarmLevel::Warning,
+                format!(
+                    "{} disagree about the block at height {height} (below our checkpoint)",
+                    names.join(", ")
+                ),
+            );
+        } else {
+            self.clear_alarm("old-block-disagreement");
+        }
+        let winner = match votes.as_slice() {
+            [(h, n), rest @ ..] if *n >= MIN_AGREEING && rest.iter().all(|(_, m)| m < n) => *h,
+            [] | [(_, 1)] => {
+                return Err(RpcError::new(
+                    RPC_MISC_ERROR,
+                    "fewer than two sources answered for this height",
+                ));
+            }
+            _ => {
+                return Err(RpcError::new(
+                    RPC_MISC_ERROR,
+                    "sources disagree about the block at this height",
+                ));
+            }
+        };
+        // The block just below the checkpoint is provable: the checkpoint
+        // header names its parent.
+        let parent_of_base = {
+            let c = self.read_chain();
+            c.hash_at(c.base_height())
+                .and_then(|b| c.header(&b))
+                .map(|h| h.prev_blockhash)
+        };
+        if height + 1 == self.read_chain().base_height()
+            && parent_of_base.is_some_and(|p| p != winner)
+        {
+            self.set_alarm(
+                "old-block-disagreement",
+                AlarmLevel::Warning,
+                format!("sources' block at height {height} isn't our checkpoint's parent"),
+            );
+            return Err(RpcError::new(
+                RPC_MISC_ERROR,
+                "sources' answer contradicts our checkpoint",
+            ));
+        }
+        if self.read_chain().contains(&winner) {
+            // A block on our proven chain can't also be an old one below it.
+            return Err(RpcError::new(
+                RPC_MISC_ERROR,
+                "sources gave a block from our own chain for an older height",
+            ));
+        }
+        let hash = winner;
+        let answers: Vec<(usize, BlockHash)> =
+            answers.into_iter().filter(|(_, h)| *h == hash).collect();
+        let max_target = bitcoin::params::Params::new(self.settings.network).max_attainable_target;
+        for &(i, _) in &answers {
+            let Ok(header) = self
+                .call(i, move |s| async move { s.header(hash).await })
+                .await
+            else {
+                continue;
+            };
+            let target = header.target();
+            if header.block_hash() != hash
+                || target > max_target
+                || header.validate_pow(target).is_err()
+            {
+                self.mark_bad(i, format!("served a bad header for old block {hash}"));
+                continue;
+            }
+            lock(&self.deep).insert(height, hash, header);
+            return Ok(hash);
+        }
+        Err(RpcError::new(
+            RPC_MISC_ERROR,
+            "no source served a valid header for this height",
+        ))
+    }
+
+    /// A below-checkpoint header found by [`Node::deep_hash_at`], with its height.
+    pub fn deep_header(&self, hash: &BlockHash) -> Option<(u32, Header)> {
+        lock(&self.deep).by_hash.get(hash).copied()
     }
 
     fn mark_progress(&self) {
@@ -816,8 +1010,11 @@ impl Node {
     }
 
     /// A verified copy of a block we know the header of.
+    /// A block on our chain, or an old one below the checkpoint whose header
+    /// [`Node::deep_hash_at`] cross-checked. Either way the block's contents
+    /// are proven against that header (hash, merkle root, witness commitment).
     pub async fn get_block(&self, hash: BlockHash) -> Result<Arc<Vec<u8>>, RpcError> {
-        if !self.read_chain().contains(&hash) {
+        if !self.read_chain().contains(&hash) && self.deep_header(&hash).is_none() {
             return Err(RpcError::new(RPC_NOT_FOUND, "Block not found"));
         }
         if let Some(raw) = lock(&self.blocks).get(&hash) {

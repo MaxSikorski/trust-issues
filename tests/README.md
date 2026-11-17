@@ -52,7 +52,7 @@ Two examples are not tests:
 |---|---|
 | only_signet_and_regtest_are_allowed | Mainnet, testnet and testnet4 are refused |
 | onions_go_through_tor_and_clearnet_is_refused | Onions need Tor; public hosts and https are refused; local hosts go direct |
-| default_signet_config_uses_both_onions_through_tor | The defaults are the two onions, both via Tor |
+| default_signet_config_uses_three_independent_onions_through_tor | The defaults are three onions (mempool.space, Emzy, Blockstream), all via Tor |
 | needs_two_sources_and_respects_the_request_ceiling | At least two sources; no more than 2 requests/s; unknown keys refused |
 | checkpoint_parses_height_and_hash | `height:hash` format |
 
@@ -76,7 +76,7 @@ Two examples are not tests:
 | fees_combine_across_sources_and_disagreement_raises_an_alarm | Median, max when urgent, alarm above 2× |
 | a_rate_limited_source_cools_off_while_the_others_carry_on | 429 + Retry-After: no requests while cooling, back afterwards |
 
-## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (12)
+## broadcast_and_rpc.rs: broadcasts and the bitcoind RPC (21)
 | Test | Checks |
 |---|---|
 | broadcast_goes_to_every_source_and_succeeds_if_any_accepts | Every source is sent it; one acceptance is success |
@@ -91,5 +91,14 @@ Two examples are not tests:
 | batches_unknown_methods_and_fees_over_rpc | Batches, -32601 for wallet calls, `estimatesmartfee`, parse errors |
 | send_then_see_it_in_our_mempool_and_spending_lookup | `sendrawtransaction`, `getrawmempool`, `gettxspendingprevout`, `getrawtransaction` |
 | the_http_server_requires_the_cookie_or_rpc_password | 401 without the right login; cookie and user/password both work; `/status` |
+| deployment_info_says_taproot_like_bitcoin_core | `getdeploymentinfo` lists taproot (and the `TAPROOT` script flag), which LND v0.21 requires |
+| old_blocks_below_the_checkpoint_are_answered_when_sources_agree | `getblockhash`, `getblockheader` and `getblock` below the checkpoint (LND's birthday search); 0 confirmations; genesis header |
+| old_blocks_fail_closed_when_sources_disagree_or_only_one_answers | Disagreement refuses and raises an alarm, which clears once they agree; one answer is never enough |
+| old_block_lookups_ask_two_sources_once_even_when_asked_twice_at_once | Two hash answers and one header per old height; concurrent requests share it |
+| a_bad_old_header_marks_its_source_and_the_honest_copy_is_used | A header that doesn't hash to the agreed block marks its source bad |
+| a_lone_dissenter_is_outvoted_for_old_blocks_but_reported | Two votes and a strict majority win; the dissent is still reported |
+| a_chain_block_offered_as_an_old_one_is_refused | A block on our proven chain can't be served as an older height |
+| an_old_answer_that_contradicts_the_checkpoint_is_refused | The block below the checkpoint must be the checkpoint's parent |
+| amounts_are_written_with_eight_decimals_like_bitcoin_core | Amounts go out as `0.00001000`, which Core Lightning's `bcli` requires |
 
-**Total: 50 tests.**
+**Total: 67 tests.**

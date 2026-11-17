@@ -73,9 +73,11 @@ cargo build --locked --release
 ./target/release/trust-issues --config examples/signet.toml
 ```
 
-Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_dir>/.cookie`, `bitcoind.rpcpolling=true`) or Core Lightning (`bitcoin-rpcconnect`, `bitcoin-rpcport=38332`, `bitcoin-datadir`) at it. To be honest, **I haven't run either of them against it yet.** That's the next milestone.
+Then point LND (`bitcoind.rpchost=127.0.0.1:38332`, `bitcoind.rpccookie=<data_dir>/.cookie`, `bitcoind.rpcpolling=true`) or Core Lightning (`bitcoin-rpcconnect`, `bitcoin-rpcport=38332`, `bitcoin-datadir`) at it. **Both have now run against it on signet:** Core Lightning v26.06.10 synced, received faucet coins and sent a payment through it (Trust Issues sent the transaction to every explorer at once). LND v0.21.8 synced too. Then Core Lightning opened a 200,000-sat channel to LND, it confirmed through Trust Issues, and a 21,000-sat payment went across it. One rough edge: LND's first rescan gave up when one explorer missed a single old-block lookup, and a restart got it through. A retry for that is on my list.
 
-**One heads-up before you try:** Blockstream's keyless API now allows 700 requests an hour per IP. Through their onion, every Tor user shares that limit, so that source is rate-limited almost all the time. For now, add a self-hosted Esplora on your own network as a second source. Otherwise Trust Issues will follow the chain but, correctly, never say "synced".
+**Sources:** by default it uses three explorers over their onions: mempool.space, [Emzy's mempool](https://mempool.emzy.de) (a separate, community-run instance) and Blockstream. Blockstream's keyless API allows 700 requests an hour per IP, and through their onion every Tor user shares that, so it's rate-limited most of the time; the other two do the work. You can add a self-hosted Esplora on your own network too.
+
+**Old blocks:** LND's wallet looks up blocks from long before Trust Issues's starting point (it searches from block 0 for its "birthday"). For those, two explorers must agree on the block, its header must check out, and a disagreement is refused and reported. That's cross-checked, not proven like the chain from the starting point on, so they're reported with 0 confirmations. The tip, which keeps your channels safe, always comes from the proven chain.
 
 ## Run it as a service
 
@@ -113,7 +115,7 @@ Mainnet stays off until someone outside the project has reviewed it. Even then, 
 cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo deny --locked check
 ```
 
-All 58 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
+All 67 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
 
 ## Found a problem?
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.

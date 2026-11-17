@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use tokio::time::Instant;
+use crate::time::Instant;
 
 /// The most requests per second any source may get, whatever the config says.
 pub const HARD_MAX_REQUESTS_PER_SEC: f64 = 2.0;
@@ -59,6 +59,7 @@ pub fn backoff(failures: u32, jitter: f64) -> Duration {
 }
 
 /// A random number in [0, 1) for jitter, from the operating system.
+#[cfg(feature = "server")]
 pub fn os_jitter() -> f64 {
     let mut b = [0u8; 4];
     if getrandom::fill(&mut b).is_err() {

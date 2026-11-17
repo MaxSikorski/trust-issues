@@ -36,6 +36,14 @@ We set up three fake explorers on a made-up chain: alice and bob are honest, mal
 
 You watch the real code catch each lie. There's no Tor, no network and no coins. Add `--fast` to skip the pauses. If a check ever fails to catch a lie, the demo says so and exits with an error. I'd rather it tell on itself than look good.
 
+**Or in your browser.** [`docs/`](docs/) has a web version of the same five scenes. It's the real Rust code compiled to WebAssembly (about 470 KB, no imports, no network), so the checks run on your own machine, and the page just replays them slowly. To try it locally:
+
+```bash
+uv run --no-project python -m http.server 8765 -d docs
+```
+
+Then open http://localhost:8765. `docs/build.sh` rebuilds the WebAssembly file from source.
+
 ## What milestone 1 does
 - **Headers:** we follow the chain from a checkpoint and take the **valid chain with the most work** that any explorer shows. Proof of work, links, difficulty rules and timestamps are checked on every header. It's proof, not a vote: one honest explorer is enough.
 - **"Synced":** only when **at least two explorers** are healthy and the tip isn't stale.
@@ -85,7 +93,7 @@ Mainnet stays off until someone outside the project has reviewed it. Even then, 
 cargo fmt --all --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo deny --locked check
 ```
 
-All 50 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
+All 53 tests are deterministic: fake explorers, a hand-set clock, no network. Every one is listed in [tests/README.md](tests/README.md).
 
 ## Found a problem?
 If it's a security issue, please report it privately. [SECURITY.md](SECURITY.md) says how. For anything else, open an issue. I'd especially love to hear where you think the threat model is wrong.

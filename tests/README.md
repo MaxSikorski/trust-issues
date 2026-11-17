@@ -1,10 +1,17 @@
 # Tests
 
-All tests are deterministic. They use generated regtest chains and scripted fake explorers (`tests/common/mod.rs`), with no network, a hand-set clock, and tokio's paused time where waits matter. Run them with `cargo test --locked`.
+All tests are deterministic. They use generated regtest chains and scripted fake explorers (`src/demo/fakes.rs`, shared with the demo through `tests/common/mod.rs`), with no network, a hand-set clock, and tokio's paused time where waits matter. Run them with `cargo test --locked`.
 
 Two examples are not tests:
-- `examples/liar.rs` (`cargo run --example liar`) is a demo that replays five of these scenarios with the same fake explorers. It exits with an error if any lie isn't caught.
+- `examples/liar.rs` (`cargo run --example liar`) prints the five demo scenes from `src/demo/`. The browser version in `docs/` animates the same scenes from a WebAssembly build (`docs/build.sh`). Both refuse to say "caught" unless the code really caught it, and `demo.rs` below checks all five.
 - `examples/socks_probe.rs` checks the SOCKS path to a real onion through your Tor.
+
+## demo.rs: the liar demo (3)
+| Test | Checks |
+|---|---|
+| the_demo_catches_all_five_lies | Five scenes, five catches, nothing missed |
+| the_demo_ends_not_synced_with_a_critical_tip_alarm | The last scene drops "synced" and raises the critical tip alarm |
+| the_demo_events_serialize_for_the_browser | The events become the JSON the web page reads |
 
 ## chain_rules.rs: the header chain (9)
 | Test | Checks |

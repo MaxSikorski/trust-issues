@@ -16,7 +16,7 @@ use bitcoin::{BlockHash, TxMerkleNode, Txid};
 use serde::Deserialize;
 
 use crate::config::{Route, SourceSpec};
-use crate::source::{FeeMap, MerkleProof, Outspend, Source, SourceError, TxStatus};
+use crate::source::{FeeMap, MerkleProof, Outspend, Source, SourceError, TxStatus, clean_text};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 /// Signet and mainnet blocks are at most 4 MB; refuse anything far bigger.
@@ -66,17 +66,6 @@ fn error_chain(e: &dyn std::error::Error) -> String {
         cur = s.source();
     }
     clean_text(&out)
-}
-
-/// Keep only printable characters and at most 200 of them: answers from
-/// sources are untrusted text.
-pub fn clean_text(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect::<String>()
-        .trim()
-        .to_string()
 }
 
 impl EsploraSource {

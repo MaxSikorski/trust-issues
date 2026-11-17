@@ -5,11 +5,20 @@
 //! Milestone 1 runs on signet only (regtest for tests).
 
 pub mod chain;
-pub mod config;
-pub mod esplora;
+pub mod demo;
 pub mod fees;
 pub mod limits;
 pub mod node;
 pub mod proof;
-pub mod rpc;
 pub mod source;
+pub mod time;
+
+#[cfg(feature = "server")]
+pub mod config;
+#[cfg(feature = "server")]
+pub mod esplora;
+#[cfg(feature = "server")]
+pub mod rpc;
+
+#[cfg(target_arch = "wasm32")]
+mod wasm;

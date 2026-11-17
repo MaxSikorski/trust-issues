@@ -83,3 +83,14 @@ pub trait Source: Send + Sync {
     /// Send a raw transaction (hex). Real sources use a fresh Tor circuit for each call.
     async fn broadcast(&self, tx_hex: &str) -> Result<Txid, SourceError>;
 }
+
+/// Keep only printable characters and at most 200 of them: answers from
+/// sources are untrusted text.
+pub fn clean_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}

@@ -8,21 +8,46 @@ repository = "https://github.com/MaxSikorski/trust-issues"
 description = "A stand-in bitcoind for Lightning nodes that reads the chain from several block explorers over Tor (signet-only milestone)"
 publish = false
 
+# `server` is the real program: Tor, the explorers' HTTP API and the RPC
+# server. Without it you get only the checking core and the demo, which is
+# what the browser version (web/) is built from.
+[features]
+default = ["server"]
+server = [
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:axum",
+    "dep:toml",
+    "dep:base64",
+    "dep:getrandom",
+    "dep:anyhow",
+    "dep:tracing-subscriber",
+]
+
+[[bin]]
+name = "trust-issues"
+path = "src/main.rs"
+required-features = ["server"]
+
+[[example]]
+name = "socks_probe"
+required-features = ["server"]
+
 [dependencies]
 bitcoin = { version = "0.32", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls-native-roots"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["socks", "rustls-tls-native-roots"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-base64 = "0.22"
-getrandom = "0.3"
+toml = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.3", optional = true }
 async-trait = "0.1"
-anyhow = "1"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+anyhow = { version = "1", optional = true }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

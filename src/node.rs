@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use crate::time::Instant;
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
 use futures::future::join_all;
 use serde_json::{Value, json};
-use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::chain::HeaderChain;
@@ -292,7 +292,7 @@ impl Node {
             st.bucket.take(Instant::now())
         };
         if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+            crate::time::sleep(wait).await;
         }
         let res = f(h.source.clone()).await;
         let now = self.clock.now();
@@ -1266,9 +1266,9 @@ pub fn parse_reject(body: &str) -> RpcError {
     if let Some(start) = body.find('{')
         && let Ok(inner) = serde_json::from_str::<Inner>(&body[start..])
     {
-        return RpcError::new(inner.code, crate::esplora::clean_text(&inner.message));
+        return RpcError::new(inner.code, crate::source::clean_text(&inner.message));
     }
-    let text = crate::esplora::clean_text(body);
+    let text = crate::source::clean_text(body);
     let code = if text.contains("already in block chain") || text.contains("already-in-chain") {
         RPC_VERIFY_ALREADY_IN_CHAIN
     } else if text.contains("missingorspent") || text.contains("missing-inputs") {
